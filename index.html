@@ -17,6 +17,14 @@
   .section-label { font-size: .65rem; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
     color: #9CA3AF; margin-bottom: .5rem; }
   .section-label.spaced { margin-top: 1.3rem; }
+  .controls { display: flex; gap: .75rem; margin-bottom: 1.5rem; }
+  .control { flex: 1; }
+  .control label { display: block; font-size: .65rem; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
+    color: #9CA3AF; margin-bottom: .35rem; }
+  .control select { width: 100%; font-family: inherit; font-size: .85rem; color: #111; background: #fff;
+    border: 1px solid #D1D5DB; border-radius: 8px; padding: .55rem .6rem; cursor: pointer; }
+  .control select.need { border-color: #E2A8A8; background: #FFF7F7; }
+  .control select:focus { outline: none; border-color: #7B8DB0; }
   .dropzone { border: 2px dashed #C4C9D8; border-radius: 12px; background: #F8F9FC; padding: 1.4rem 1.5rem;
     text-align: center; cursor: pointer; transition: border-color .2s, background .2s; position: relative; }
   .dropzone:hover, .dropzone.drag-over { border-color: #7B8DB0; background: #F0F3FA; }
@@ -54,6 +62,15 @@
   .stat .num { font-size: 1.35rem; font-weight: 700; color: #111; line-height: 1.1; }
   .stat .num.bad { color: #C0392B; }
   .stat .lbl { font-size: .68rem; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: #9CA3AF; margin-top: .2rem; }
+  .reports { padding: 1rem 2rem 0; display: flex; flex-direction: column; gap: .45rem; }
+  .reports-head { font-size: .65rem; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: #9CA3AF; }
+  .report-row { display: flex; align-items: center; gap: .6rem; background: #F8F9FC; border: 1px solid #EEF1F6;
+    border-radius: 10px; padding: .55rem .75rem; font-size: .82rem; }
+  .report-row .rname { flex: 1 1 auto; font-weight: 600; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .report-row .rmeta { color: #6B7280; font-size: .76rem; white-space: nowrap; }
+  .report-row .rmeta .bad { color: #C0392B; font-weight: 600; }
+  .report-row .rdl { color: #4B6FBE; text-decoration: none; font-weight: 600; font-size: .78rem; white-space: nowrap; }
+  .report-row .rdl:hover { text-decoration: underline; }
   .download-wrap { padding: 1.1rem 2rem 1.5rem; }
   .btn-download { display: block; width: 100%; background: #374151; color: #fff; border: none; border-radius: 8px;
     padding: .7rem 1.25rem; font-family: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; text-align: center;
@@ -77,13 +94,24 @@
 <div class="card">
   <div class="card-body">
     <div class="card-title">Season Ticket Buy-In Review</div>
-    <div class="card-sub">Reconcile the HAL-NFL season-ticket database against the purchase details loaded into TicketVault. Every HAL record is checked for a matching buy-in at the right cost and game count.</div>
+    <div class="card-sub">Reconcile the HAL season-ticket database against the purchase details loaded into TicketVault. Records are split by <strong>Company</strong>, and each company gets its own report named <em>Seasons Review - Company - League - Year</em>.</div>
 
-    <div class="section-label">Season Ticket Database — upload the HAL-NFL export (.csv / .xlsx).</div>
+    <div class="controls">
+      <div class="control">
+        <label>League</label>
+        <select id="league"><option value="" selected disabled>Choose…</option></select>
+      </div>
+      <div class="control">
+        <label>Year</label>
+        <select id="year"><option value="" selected disabled>Choose…</option></select>
+      </div>
+    </div>
+
+    <div class="section-label">Season Ticket Database — upload the HAL export(s) (.csv / .xlsx).</div>
     <div class="dropzone" id="dzHal" data-key="hal">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
-      <div class="dropzone-hint">The HAL season-ticket list &middot; .csv / .xlsx / .xlsm</div>
+      <div class="dropzone-hint">One or more HAL lists &middot; split by Company column (or file name) &middot; .csv / .xlsx / .xlsm</div>
     </div>
     <div class="file-list" id="listHal"></div>
 
@@ -115,11 +143,33 @@
 </div>
 
 <script>
+  const LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"];
+  const YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"];
+
   const store = { hal: [], details: [] };
+  const leagueSel = document.getElementById('league');
+  const yearSel = document.getElementById('year');
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
   const spinner = document.getElementById('spinner');
   const resultsDiv = document.getElementById('results');
+
+  function fillSelect(sel, opts) {
+    opts.forEach(o => {
+      const el = document.createElement('option');
+      el.value = o; el.textContent = o; sel.appendChild(el);
+    });
+  }
+  fillSelect(leagueSel, LEAGUES);
+  fillSelect(yearSel, YEARS);
+  // keep server as source of truth if it differs
+  fetch('/options').then(r => r.json()).then(d => {
+    if (d.leagues) { leagueSel.length = 1; fillSelect(leagueSel, d.leagues); }
+    if (d.years) { yearSel.length = 1; fillSelect(yearSel, d.years); }
+  }).catch(() => {});
+  [leagueSel, yearSel].forEach(s => s.addEventListener('change', () => {
+    s.classList.toggle('need', !s.value); updateBtn();
+  }));
 
   function listEl(key) { return document.getElementById(key === 'hal' ? 'listHal' : 'listDetails'); }
 
@@ -156,7 +206,9 @@
     updateBtn();
   }
 
-  function ready() { return store.hal.length > 0 && store.details.length > 0; }
+  function ready() {
+    return leagueSel.value && yearSel.value && store.hal.length > 0 && store.details.length > 0;
+  }
   function updateBtn() { processBtn.disabled = !ready(); }
 
   const warnModal = document.getElementById('warnModal');
@@ -174,12 +226,16 @@
     resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
   });
 
+  function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
   processBtn.addEventListener('click', async () => {
     if (!ready()) return;
     processBtn.disabled = true; btnLabel.textContent = 'Reconciling…'; spinner.style.display = 'block';
     resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
 
     const fd = new FormData();
+    fd.append('league', leagueSel.value);
+    fd.append('year', yearSel.value);
     store.hal.forEach(e => fd.append('hal', e.file));
     store.details.forEach(e => fd.append('details', e.file));
 
@@ -192,8 +248,16 @@
       } else {
         const ok = d.clean;
         const verdict = ok
-          ? `All ${d.reconciled} HAL records reconciled against TicketVault.`
-          : `${d.not_reconciled} record${d.not_reconciled === 1 ? '' : 's'} not reconciled — see the Not Reconciled tab.`;
+          ? `All ${d.reconciled} HAL records reconciled across ${d.companies} compan${d.companies === 1 ? 'y' : 'ies'}.`
+          : `${d.not_reconciled} record${d.not_reconciled === 1 ? '' : 's'} not reconciled across ${d.companies} compan${d.companies === 1 ? 'y' : 'ies'} — see each report.`;
+
+        const reportRows = d.reports.map(r => `
+          <div class="report-row">
+            <span class="rname" title="${esc(r.company)}">${esc(r.company)}</span>
+            <span class="rmeta">${r.reconciled} ✓ / <span class="${r.not_reconciled ? 'bad' : ''}">${r.not_reconciled} ✗</span></span>
+            <a class="rdl" href="${r.download_url}">Download</a>
+          </div>`).join('');
+
         resultsDiv.innerHTML = `
           <div class="verdict"><div class="verdict-badge ${ok ? 'ok' : 'bad'}">${verdict}</div></div>
           <div class="stat-grid">
@@ -201,7 +265,11 @@
             <div class="stat"><div class="num">${d.reconciled}</div><div class="lbl">Reconciled</div></div>
             <div class="stat"><div class="num ${d.not_reconciled ? 'bad' : ''}">${d.not_reconciled}</div><div class="lbl">Not Reconciled</div></div>
           </div>
-          <div class="download-wrap"><a class="btn-download" href="${d.download_url}">Download Reconciliation Workbook</a></div>`;
+          <div class="reports">
+            <div class="reports-head">${d.companies} report${d.companies === 1 ? '' : 's'} &middot; ${esc(d.league)} &middot; ${esc(d.year)}</div>
+            ${reportRows}
+          </div>
+          <div class="download-wrap"><a class="btn-download" href="${d.download_all_url}">${d.companies > 1 ? 'Download all reports (ZIP)' : 'Download Reconciliation Workbook'}</a></div>`;
         resultsDiv.style.display = 'block';
         if (d.warnings && d.warnings.length) showWarnModal(d.warnings);
       }

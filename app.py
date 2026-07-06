@@ -19,7 +19,14 @@ Otherwise it is NOT RECONCILED, with a note:
 Match key: email + team + section/row + individual seat number. Direction is
 HAL -> TicketVault only (vault rows with no HAL record are ignored).
 
-Output workbook tabs: Summary, Reconciled, Not Reconciled.
+Multiple companies can be uploaded together. Records are split by a "Company"
+column in the HAL file (falling back to the file name), and EACH COMPANY gets
+its own workbook. League and Year are chosen in the UI and drive the file name:
+
+    Seasons Review - {Company} - {League} - {Year}.xlsx
+
+Output workbook tabs: Summary (with Company / League / Year), Reconciled,
+Not Reconciled.
 """
 
 import io
@@ -28,8 +35,9 @@ import csv
 import re
 import time
 import uuid
+import zipfile
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, abort
 from openpyxl import Workbook, load_workbook
@@ -43,6 +51,8 @@ STORE_DIR = os.path.join(tempfile.gettempdir(), "recon_store")
 os.makedirs(STORE_DIR, exist_ok=True)
 
 DEFAULT_TOLERANCE = 1.00  # dollars; TV total must tie to HAL total within this
+LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
+YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 
 # --------------------------------------------------------------------------- #
 # Generic helpers
@@ -129,6 +139,16 @@ def _cell(row, i):
     return row[i] if (i is not None and i < len(row)) else None
 
 
+def _safe_name(s):
+    """Sanitize a string for use in a file name."""
+    return re.sub(r'[\\/:*?"<>|]+', " ", str(s or "")).strip() or "Unknown"
+
+
+def _company_from_filename(filename):
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return stem.strip() or "Unknown"
+
+
 # --------------------------------------------------------------------------- #
 # Seat / key normalization
 # --------------------------------------------------------------------------- #
@@ -175,9 +195,12 @@ def _is_parking_pv(sec, row):
 # --------------------------------------------------------------------------- #
 
 def parse_hal(rows, filename):
-    """Parse the HAL-NFL season-ticket database. One record per seat block."""
+    """Parse the HAL-NFL season-ticket database. One record per seat block.
+    Each record is tagged with its Company (from a 'Company' column if present,
+    otherwise the file name)."""
     hidx, header = _find_header_row(rows)
     ci = {
+        "company": _col_index(header, "Company", "Client", "Broker"),
         "email": _col_index(header, "Email"),
         "team": _col_index(header, "Team"),
         "fp": _col_index(header, "Full/Partial"),
@@ -191,14 +214,17 @@ def parse_hal(rows, filename):
     if ci["email"] is None or ci["team"] is None:
         raise ValueError(f"{os.path.basename(filename)}: HAL file is missing an "
                          f"'Email' or 'Team' column.")
+    default_company = _company_from_filename(filename)
     out = []
     for row in rows[hidx + 1:]:
         team = _team(_cell(row, ci["team"]))
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
             continue
+        company = str(_cell(row, ci["company"]) or "").strip() or default_company
         games = _amount(_cell(row, ci["games"]))
         out.append({
+            "company": company,
             "emails": emails,
             "team": team,
             "Full/Partial": str(_cell(row, ci["fp"]) or "").strip(),
@@ -349,7 +375,6 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_la
     for j, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(j)].width = w
     n = len(headers)
-    # row 1 — group bands
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=hal_last)
     ws.merge_cells(start_row=1, start_column=tv_first, end_row=1, end_column=tv_last)
     a = ws.cell(1, 1, "per HAL"); a.font = Font(name=ARIAL, size=9, bold=True); a.alignment = CENTER; a.fill = HAL_FILL
@@ -358,10 +383,8 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_la
         ws.cell(1, c).fill = HAL_FILL
     for c in range(tv_first, tv_last + 1):
         ws.cell(1, c).fill = TV_FILL
-    # row 2 — column headers
     for j, h in enumerate(headers, 1):
         cell = ws.cell(2, j, h); cell.font = Font(name=ARIAL, size=10, bold=True); cell.alignment = CENTER
-    # data
     for i, r in enumerate(rows, 3):
         for j, src in enumerate(srcs, 1):
             cell = ws.cell(i, j, r.get(src))
@@ -369,7 +392,6 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_la
             if j in cost_cols:
                 cell.number_format = CUR
     end = 2 + len(rows)
-    # vertical group separators
     for rr in range(1, end + 1):
         ws.cell(rr, 1).border = Border(left=THIN, right=(THIN if rr == 1 else None))
         ws.cell(rr, hal_last).border = Border(right=THIN)
@@ -380,7 +402,7 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_la
     ws.auto_filter.ref = f"A2:{get_column_letter(n)}{end}"
 
 
-def build_workbook(reconciled, not_reconciled, hal_total, tolerance):
+def build_workbook(company, league, year, reconciled, not_reconciled, hal_total, tolerance):
     rec_n = len(reconciled)
     nr_n = len(not_reconciled)
     nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not bought in")
@@ -395,8 +417,16 @@ def build_workbook(reconciled, not_reconciled, hal_total, tolerance):
     ws.column_dimensions["A"].width = 72.7
     ws.column_dimensions["B"].width = 12.0
     ws.merge_cells("A1:B1")
-    t = ws.cell(1, 1, "Season Ticket Buy-In Review — HAL vs TicketVault")
+    t = ws.cell(1, 1, "Seasons Review")
     t.font = Font(name=ARIAL, size=15, bold=True, color=NAVY); t.alignment = CENTER
+
+    def info(r, text, size, bold):
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=size, bold=bold, color=NAVY); c.alignment = CENTER
+
+    info(3, f"Company:  {company}", 11, True)
+    info(4, f"League:  {league}", 10, False)
+    info(5, f"Year:  {year}", 10, False)
 
     def bar(r, text):
         c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
@@ -413,14 +443,14 @@ def build_workbook(reconciled, not_reconciled, hal_total, tolerance):
         for c in (ca, cb):
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
-    bar(3, "RESULT"); hd(4, "Metric", "Count")
-    line(5, "Reconciled", rec_n)
-    line(6, "Not Reconciled", nr_n)
-    line(7, "Total # HAL Records", hal_total, bold=True)
-    bar(9, "NOT RECONCILED — BY REASON"); hd(10, "Reason", "Count")
-    line(11, "Not bought in", nbi)
-    line(12, "Partially bought in", part)
-    line(13, "TOTAL", nr_n, bold=True)
+    bar(7, "RESULT"); hd(8, "Metric", "Count")
+    line(9, "Reconciled", rec_n)
+    line(10, "Not Reconciled", nr_n)
+    line(11, "Total # HAL Records", hal_total, bold=True)
+    bar(13, "NOT RECONCILED — BY REASON"); hd(14, "Reason", "Count")
+    line(15, "Not bought in", nbi)
+    line(16, "Partially bought in", part)
+    line(17, "TOTAL", nr_n, bold=True)
 
     # ---- Reconciled ----------------------------------------------------- #
     ws_r = wb.create_sheet("Reconciled")
@@ -435,11 +465,8 @@ def build_workbook(reconciled, not_reconciled, hal_total, tolerance):
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    meta = {
-        "total_records": hal_total, "reconciled": rec_n, "not_reconciled": nr_n,
-        "not_bought_in": nbi, "partially": part, "clean": nr_n == 0,
-    }
-    return bio.read(), meta
+    return bio.read(), {"reconciled": rec_n, "not_reconciled": nr_n,
+                        "not_bought_in": nbi, "partially": part, "clean": nr_n == 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -451,12 +478,24 @@ def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
+@app.route("/options")
+def options():
+    return jsonify({"leagues": LEAGUES, "years": YEARS})
+
+
 @app.route("/process", methods=["POST"])
 def process():
     hal_files = [f for f in request.files.getlist("hal") if f.filename]
     details_files = [f for f in request.files.getlist("details") if f.filename]
+    league = (request.form.get("league") or "").strip()
+    year = (request.form.get("year") or "").strip()
+
+    if league not in LEAGUES:
+        return jsonify({"error": "Please choose a League."}), 400
+    if year not in YEARS:
+        return jsonify({"error": "Please choose a Year."}), 400
     if not hal_files:
-        return jsonify({"error": "Please upload the HAL-NFL season ticket database."}), 400
+        return jsonify({"error": "Please upload at least one HAL season ticket database."}), 400
     if not details_files:
         return jsonify({"error": "Please upload at least one TicketVault Purchase Details file."}), 400
 
@@ -474,7 +513,7 @@ def process():
         for f in hal_files:
             hal_rows.extend(parse_hal(_rows_from_upload(f.filename, f.read()), f.filename))
         if not hal_rows:
-            return jsonify({"error": "No season-ticket records found in the HAL file."}), 400
+            return jsonify({"error": "No season-ticket records found in the HAL file(s)."}), 400
 
         index = defaultdict(list)
         detail_rows = 0
@@ -486,45 +525,101 @@ def process():
         if detail_rows == 0:
             return jsonify({"error": "No rows found in the Purchase Details file(s)."}), 400
 
-        # warn about HAL teams with no TicketVault presence at all
         hal_teams = {r["team"] for r in hal_rows}
         pv_teams = {t for (_e, t) in index}
         missing_teams = sorted(hal_teams - pv_teams)
         if missing_teams:
             shown = ", ".join(missing_teams[:6]) + ("…" if len(missing_teams) > 6 else "")
             warnings.append(f"{len(missing_teams)} team(s) in HAL have no rows in any "
-                            f"Purchase Details file — all their records will show as "
+                            f"Purchase Details file — those records will show as "
                             f"“Not bought in”: {shown}")
 
-        reconciled, not_reconciled = reconcile(hal_rows, index, tolerance)
-        data, meta = build_workbook(reconciled, not_reconciled, len(hal_rows), tolerance)
+        # split records by company, one workbook per company
+        by_company = OrderedDict()
+        for r in hal_rows:
+            by_company.setdefault(r["company"], []).append(r)
+
+        token = uuid.uuid4().hex
+        folder = os.path.join(STORE_DIR, token)
+        os.makedirs(folder, exist_ok=True)
+
+        reports = []
+        tot_rec = tot_nr = 0
+        for company, rows in by_company.items():
+            reconciled, not_reconciled = reconcile(rows, index, tolerance)
+            data, m = build_workbook(company, league, year, reconciled,
+                                     not_reconciled, len(rows), tolerance)
+            fname = f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - {_safe_name(year)}.xlsx"
+            with open(os.path.join(folder, fname), "wb") as fh:
+                fh.write(data)
+            tot_rec += m["reconciled"]
+            tot_nr += m["not_reconciled"]
+            reports.append({
+                "company": company, "records": len(rows),
+                "reconciled": m["reconciled"], "not_reconciled": m["not_reconciled"],
+                "clean": m["clean"], "filename": fname,
+                "download_url": f"/download/{token}/{fname}",
+            })
+
+        reports.sort(key=lambda x: x["company"].lower())
+
+        # bundle all reports into a single zip when there's more than one company
+        if len(reports) > 1:
+            zip_name = f"Seasons Review - {_safe_name(league)} - {_safe_name(year)}.zip"
+            with zipfile.ZipFile(os.path.join(folder, zip_name), "w",
+                                 zipfile.ZIP_DEFLATED) as zf:
+                for rep in reports:
+                    zf.write(os.path.join(folder, rep["filename"]), rep["filename"])
+            download_all_url = f"/download/{token}"
+            download_all_name = zip_name
+        else:
+            download_all_url = reports[0]["download_url"]
+            download_all_name = reports[0]["filename"]
+
+        _cleanup_old()
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
-    token = uuid.uuid4().hex
-    fn_out = "Season Ticket Reconciliation.xlsx"
-    folder = os.path.join(STORE_DIR, token)
-    os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, fn_out), "wb") as fh:
-        fh.write(data)
-    _cleanup_old()
-    meta.update({"download_url": f"/download/{token}", "filename": fn_out,
-                 "warnings": warnings})
-    return jsonify(meta)
+    return jsonify({
+        "league": league, "year": year,
+        "companies": len(reports),
+        "total_records": len(hal_rows), "reconciled": tot_rec, "not_reconciled": tot_nr,
+        "clean": tot_nr == 0,
+        "reports": reports,
+        "download_all_url": download_all_url, "download_all_name": download_all_name,
+        "warnings": warnings,
+    })
 
 
 @app.route("/download/<token>")
-def download(token):
+def download_all(token):
     folder = os.path.join(STORE_DIR, os.path.basename(token))
     if not os.path.isdir(folder):
         abort(404)
+    zips = [f for f in os.listdir(folder) if f.lower().endswith(".zip")]
+    if zips:
+        pick = zips[0]
+        return send_file(os.path.join(folder, pick), mimetype="application/zip",
+                         as_attachment=True, download_name=pick)
     xlsx = [f for f in os.listdir(folder) if f.lower().endswith(".xlsx")]
-    if not xlsx:
+    if len(xlsx) == 1:
+        pick = xlsx[0]
+        return send_file(os.path.join(folder, pick),
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name=pick)
+    abort(404)
+
+
+@app.route("/download/<token>/<path:name>")
+def download_one(token, name):
+    folder = os.path.join(STORE_DIR, os.path.basename(token))
+    safe = os.path.basename(name)
+    path = os.path.join(folder, safe)
+    if not os.path.isfile(path):
         abort(404)
-    pick = xlsx[0]
-    return send_file(os.path.join(folder, pick),
+    return send_file(path,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                     as_attachment=True, download_name=pick)
+                     as_attachment=True, download_name=safe)
 
 
 if __name__ == "__main__":
