@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Season Ticket Buy-In Review</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', sans-serif; background: #EAECF0; min-height: 100vh; display: flex;
+    align-items: center; justify-content: center; padding: 2rem 1rem; color: #111; }
+  .card { background: #fff; border-radius: 20px; box-shadow: 0 2px 8px rgba(0,0,0,.07), 0 8px 32px rgba(0,0,0,.09);
+    width: 100%; max-width: 640px; overflow: hidden; }
+  .card-body { padding: 2rem 2rem 1.75rem; }
+  .card-title { font-size: 1.3rem; font-weight: 700; margin-bottom: .35rem; letter-spacing: -.01em; }
+  .card-sub { font-size: .875rem; color: #6B7280; line-height: 1.6; margin-bottom: 1.6rem; }
+  .section-label { font-size: .65rem; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
+    color: #9CA3AF; margin-bottom: .5rem; }
+  .section-label.spaced { margin-top: 1.3rem; }
+  .dropzone { border: 2px dashed #C4C9D8; border-radius: 12px; background: #F8F9FC; padding: 1.4rem 1.5rem;
+    text-align: center; cursor: pointer; transition: border-color .2s, background .2s; position: relative; }
+  .dropzone:hover, .dropzone.drag-over { border-color: #7B8DB0; background: #F0F3FA; }
+  .dropzone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .dropzone-text { font-size: .9rem; color: #374151; }
+  .dropzone-text a { color: #4B6FBE; text-decoration: none; }
+  .dropzone-text a:hover { text-decoration: underline; }
+  .dropzone-hint { font-size: .78rem; color: #9CA3AF; margin-top: .25rem; }
+  .file-list { display: flex; flex-direction: column; gap: .45rem; margin-top: .6rem; }
+  .file-row { display: flex; align-items: center; gap: .5rem; background: #F3F4F6; border-radius: 8px;
+    padding: .45rem .6rem; font-size: .8rem; color: #374151; flex-wrap: wrap; }
+  .file-row .fname { flex: 1 1 180px; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-row .remove { cursor: pointer; color: #9CA3AF; background: none; border: none; font-size: 1rem;
+    line-height: 1; padding: 0 2px; }
+  .file-row .remove:hover { color: #374151; }
+  .actions { display: flex; gap: .75rem; margin-top: 1.5rem; }
+  .btn-process { flex: 1; background: #4B5563; color: #fff; border: none; border-radius: 8px; padding: .7rem 1.25rem;
+    font-family: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; gap: .5rem; transition: background .15s; }
+  .btn-process:hover:not(:disabled) { background: #1F2937; }
+  .btn-process:disabled { opacity: .55; cursor: not-allowed; }
+  .btn-clear { background: #fff; color: #374151; border: 1px solid #D1D5DB; border-radius: 8px; padding: .7rem 1.25rem;
+    font-family: inherit; font-weight: 500; font-size: .9rem; cursor: pointer; transition: background .15s, border-color .15s; }
+  .btn-clear:hover { background: #F9FAFB; border-color: #9CA3AF; }
+  .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+    border-radius: 50%; animation: spin .7s linear infinite; display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .results { border-top: 1px solid #F3F4F6; }
+  .verdict { padding: 1.25rem 2rem 0; }
+  .verdict-badge { border-radius: 10px; padding: .85rem 1.1rem; font-size: .92rem; font-weight: 600; line-height: 1.5; }
+  .verdict-badge.ok { background: #E7F6EC; border: 1px solid #A7D8B8; color: #1E7E45; }
+  .verdict-badge.bad { background: #FDECEC; border: 1px solid #F1B5B5; color: #C0392B; }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; padding: 1rem 2rem 0; }
+  .stat { background: #F8F9FC; border: 1px solid #EEF1F6; border-radius: 10px; padding: .7rem .8rem; text-align: center; }
+  .stat .num { font-size: 1.35rem; font-weight: 700; color: #111; line-height: 1.1; }
+  .stat .num.bad { color: #C0392B; }
+  .stat .lbl { font-size: .68rem; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; color: #9CA3AF; margin-top: .2rem; }
+  .download-wrap { padding: 1.1rem 2rem 1.5rem; }
+  .btn-download { display: block; width: 100%; background: #374151; color: #fff; border: none; border-radius: 8px;
+    padding: .7rem 1.25rem; font-family: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; text-align: center;
+    text-decoration: none; transition: background .15s; }
+  .btn-download:hover { background: #1F2937; }
+  .error-item { padding: 1rem 2rem; background: #FEF2F2; border-top: 1px solid #FECACA; }
+  .error-item p { font-size: .85rem; color: #B91C1C; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(17,24,39,.5); display: none; align-items: center;
+    justify-content: center; z-index: 50; padding: 1rem; }
+  .modal { background: #fff; border-radius: 14px; max-width: 480px; width: 100%; padding: 1.5rem 1.5rem 1.25rem;
+    box-shadow: 0 10px 40px rgba(0,0,0,.25); }
+  .modal-title { font-size: 1rem; font-weight: 700; color: #92400E; margin-bottom: .8rem; }
+  .modal-list { margin: 0 0 1.15rem; padding-left: 1.15rem; }
+  .modal-list li { font-size: .87rem; color: #374151; line-height: 1.55; margin-bottom: .35rem; }
+  .modal-ok { display: block; width: 100%; background: #4B5563; color: #fff; border: none; border-radius: 8px;
+    padding: .65rem; font-family: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; transition: background .15s; }
+  .modal-ok:hover { background: #1F2937; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="card-body">
+    <div class="card-title">Season Ticket Buy-In Review</div>
+    <div class="card-sub">Reconcile the HAL-NFL season-ticket database against the purchase details loaded into TicketVault. Every HAL record is checked for a matching buy-in at the right cost and game count.</div>
+
+    <div class="section-label">Season Ticket Database — upload the HAL-NFL export (.csv / .xlsx).</div>
+    <div class="dropzone" id="dzHal" data-key="hal">
+      <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
+      <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
+      <div class="dropzone-hint">The HAL season-ticket list &middot; .csv / .xlsx / .xlsm</div>
+    </div>
+    <div class="file-list" id="listHal"></div>
+
+    <div class="section-label spaced">Purchase Details — upload the TicketVault Purchase Details export(s).</div>
+    <div class="dropzone" id="dzDetails" data-key="details">
+      <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
+      <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
+      <div class="dropzone-hint">One or more files &middot; .csv / .xlsx / .xlsm</div>
+    </div>
+    <div class="file-list" id="listDetails"></div>
+
+    <div class="actions">
+      <button class="btn-process" id="processBtn" disabled>
+        <span id="btnLabel">Reconcile</span>
+        <div class="spinner" id="spinner"></div>
+      </button>
+      <button class="btn-clear" id="clearBtn">Clear</button>
+    </div>
+  </div>
+  <div class="results" id="results" style="display:none;"></div>
+</div>
+
+<div class="modal-overlay" id="warnModal">
+  <div class="modal">
+    <div class="modal-title">Please review before relying on the results</div>
+    <ul class="modal-list" id="warnList"></ul>
+    <button class="modal-ok" id="warnOk">Okay</button>
+  </div>
+</div>
+
+<script>
+  const store = { hal: [], details: [] };
+  const processBtn = document.getElementById('processBtn');
+  const btnLabel = document.getElementById('btnLabel');
+  const spinner = document.getElementById('spinner');
+  const resultsDiv = document.getElementById('results');
+
+  function listEl(key) { return document.getElementById(key === 'hal' ? 'listHal' : 'listDetails'); }
+
+  function setup(id) {
+    const dz = document.getElementById(id);
+    const key = dz.dataset.key;
+    const input = dz.querySelector('input[type="file"]');
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); add(key, e.dataTransfer.files); });
+    input.addEventListener('change', () => { add(key, input.files); input.value = ''; });
+    dz.querySelector('.browse').addEventListener('click', e => { e.preventDefault(); input.click(); });
+  }
+
+  function add(key, fileList) {
+    [...fileList].filter(f => /\.(csv|xlsx|xlsm)$/i.test(f.name)).forEach(f => {
+      if (store[key].some(x => x.file.name === f.name && x.file.size === f.size)) return;
+      store[key].push({ file: f });
+    });
+    render(key);
+  }
+
+  function render(key) {
+    const list = listEl(key);
+    list.innerHTML = '';
+    store[key].forEach((entry, i) => {
+      const row = document.createElement('div');
+      row.className = 'file-row';
+      row.innerHTML = `<span class="fname" title="${entry.file.name}">${entry.file.name}</span>` +
+                      `<button class="remove" title="Remove">&times;</button>`;
+      row.querySelector('.remove').addEventListener('click', () => { store[key].splice(i, 1); render(key); });
+      list.appendChild(row);
+    });
+    updateBtn();
+  }
+
+  function ready() { return store.hal.length > 0 && store.details.length > 0; }
+  function updateBtn() { processBtn.disabled = !ready(); }
+
+  const warnModal = document.getElementById('warnModal');
+  document.getElementById('warnOk').addEventListener('click', () => { warnModal.style.display = 'none'; });
+  function showWarnModal(warnings) {
+    document.getElementById('warnList').innerHTML = warnings.map(w => `<li>${w}</li>`).join('');
+    warnModal.style.display = 'flex';
+  }
+
+  ['dzHal', 'dzDetails'].forEach(setup);
+
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    store.hal = []; store.details = [];
+    render('hal'); render('details');
+    resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
+  });
+
+  processBtn.addEventListener('click', async () => {
+    if (!ready()) return;
+    processBtn.disabled = true; btnLabel.textContent = 'Reconciling…'; spinner.style.display = 'block';
+    resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
+
+    const fd = new FormData();
+    store.hal.forEach(e => fd.append('hal', e.file));
+    store.details.forEach(e => fd.append('details', e.file));
+
+    try {
+      const resp = await fetch('/process', { method: 'POST', body: fd });
+      const d = await resp.json();
+      if (!resp.ok || d.error) {
+        resultsDiv.innerHTML = `<div class="error-item"><p><strong>Error:</strong> ${d.error || 'Processing failed.'}</p></div>`;
+        resultsDiv.style.display = 'block';
+      } else {
+        const ok = d.clean;
+        const verdict = ok
+          ? `All ${d.reconciled} HAL records reconciled against TicketVault.`
+          : `${d.not_reconciled} record${d.not_reconciled === 1 ? '' : 's'} not reconciled — see the Not Reconciled tab.`;
+        resultsDiv.innerHTML = `
+          <div class="verdict"><div class="verdict-badge ${ok ? 'ok' : 'bad'}">${verdict}</div></div>
+          <div class="stat-grid">
+            <div class="stat"><div class="num">${d.total_records}</div><div class="lbl">HAL Records</div></div>
+            <div class="stat"><div class="num">${d.reconciled}</div><div class="lbl">Reconciled</div></div>
+            <div class="stat"><div class="num ${d.not_reconciled ? 'bad' : ''}">${d.not_reconciled}</div><div class="lbl">Not Reconciled</div></div>
+          </div>
+          <div class="download-wrap"><a class="btn-download" href="${d.download_url}">Download Reconciliation Workbook</a></div>`;
+        resultsDiv.style.display = 'block';
+        if (d.warnings && d.warnings.length) showWarnModal(d.warnings);
+      }
+    } catch (err) {
+      resultsDiv.innerHTML = `<div class="error-item"><p><strong>Network error:</strong> ${err.message}</p></div>`;
+      resultsDiv.style.display = 'block';
+    } finally {
+      updateBtn(); btnLabel.textContent = 'Reconcile'; spinner.style.display = 'none';
+    }
+  });
+</script>
+</body>
+</html>
