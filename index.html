@@ -23,6 +23,10 @@
     color: #9CA3AF; margin-bottom: .35rem; }
   .control select { width: 100%; font-family: inherit; font-size: .85rem; color: #111; background: #fff;
     border: 1px solid #D1D5DB; border-radius: 8px; padding: .55rem .6rem; cursor: pointer; }
+  .control input[type="date"] { width: 100%; font-family: inherit; font-size: .85rem; color: #111; background: #fff;
+    border: 1px solid #D1D5DB; border-radius: 8px; padding: .5rem .6rem; cursor: pointer; }
+  .control input[type="date"].need { border-color: #E2A8A8; background: #FFF7F7; }
+  .control input[type="date"]:focus { outline: none; border-color: #7B8DB0; }
   .control select.need { border-color: #E2A8A8; background: #FFF7F7; }
   .control select:focus { outline: none; border-color: #7B8DB0; }
   .dropzone { border: 2px dashed #C4C9D8; border-radius: 12px; background: #F8F9FC; padding: 1.4rem 1.5rem;
@@ -37,6 +41,10 @@
   .file-row { display: flex; align-items: center; gap: .5rem; background: #F3F4F6; border-radius: 8px;
     padding: .45rem .6rem; font-size: .8rem; color: #374151; flex-wrap: wrap; }
   .file-row .fname { flex: 1 1 180px; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-row select { font-family: inherit; font-size: .76rem; color: #111; background: #fff;
+    border: 1px solid #D1D5DB; border-radius: 6px; padding: .3rem .4rem; cursor: pointer; }
+  .file-row select.need { border-color: #E2A8A8; background: #FFF7F7; }
+  .file-row select:focus { outline: none; border-color: #7B8DB0; }
   .file-row .remove { cursor: pointer; color: #9CA3AF; background: none; border: none; font-size: 1rem;
     line-height: 1; padding: 0 2px; }
   .file-row .remove:hover { color: #374151; }
@@ -94,7 +102,7 @@
 <div class="card">
   <div class="card-body">
     <div class="card-title">Season Ticket Buy-In Review</div>
-    <div class="card-sub">Reconcile the HAL season-ticket database against the purchase details loaded into TicketVault. Records are split by <strong>Company</strong>, and each company gets its own report named <em>Seasons Review - Company - League - Year</em>.</div>
+    <div class="card-sub">Reconcile HAL season-ticket databases against the purchase details loaded into TicketVault. Tag each HAL file with its <strong>Company</strong>; each company gets its own report named <em>Seasons Review - Company - League - Year</em>.</div>
 
     <div class="controls">
       <div class="control">
@@ -105,13 +113,17 @@
         <label>Year</label>
         <select id="year"><option value="" selected disabled>Choose…</option></select>
       </div>
+      <div class="control">
+        <label>As Of Date</label>
+        <input type="date" id="asof">
+      </div>
     </div>
 
-    <div class="section-label">Season Ticket Database — upload the HAL export(s) (.csv / .xlsx).</div>
+    <div class="section-label">Season Ticket Database — upload the HAL export(s) and pick a Company per file.</div>
     <div class="dropzone" id="dzHal" data-key="hal">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
-      <div class="dropzone-hint">One or more HAL lists &middot; split by Company column (or file name) &middot; .csv / .xlsx / .xlsm</div>
+      <div class="dropzone-hint">One or more HAL lists &middot; choose the company per file &middot; .csv / .xlsx / .xlsm</div>
     </div>
     <div class="file-list" id="listHal"></div>
 
@@ -143,35 +155,48 @@
 </div>
 
 <script>
-  const LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"];
-  const YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"];
+  let LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"];
+  let YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"];
+  let COMPANIES = ["TTG", "Y&S", "YourTix", "Asher", "Chase", "Katz", "Levine",
+                   "Levovitz", "TL", "GK", "Grossman", "Pollak", "Sternbuch", "Waxler"];
 
   const store = { hal: [], details: [] };
   const leagueSel = document.getElementById('league');
   const yearSel = document.getElementById('year');
+  const asofInput = document.getElementById('asof');
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
   const spinner = document.getElementById('spinner');
   const resultsDiv = document.getElementById('results');
 
   function fillSelect(sel, opts) {
-    opts.forEach(o => {
-      const el = document.createElement('option');
-      el.value = o; el.textContent = o; sel.appendChild(el);
-    });
+    opts.forEach(o => { const el = document.createElement('option'); el.value = o; el.textContent = o; sel.appendChild(el); });
   }
   fillSelect(leagueSel, LEAGUES);
   fillSelect(yearSel, YEARS);
-  // keep server as source of truth if it differs
   fetch('/options').then(r => r.json()).then(d => {
-    if (d.leagues) { leagueSel.length = 1; fillSelect(leagueSel, d.leagues); }
-    if (d.years) { yearSel.length = 1; fillSelect(yearSel, d.years); }
+    if (d.leagues) { LEAGUES = d.leagues; leagueSel.length = 1; fillSelect(leagueSel, LEAGUES); }
+    if (d.years) { YEARS = d.years; yearSel.length = 1; fillSelect(yearSel, YEARS); }
+    if (d.companies && d.companies.length) { COMPANIES = d.companies; render('hal'); }
   }).catch(() => {});
   [leagueSel, yearSel].forEach(s => s.addEventListener('change', () => {
     s.classList.toggle('need', !s.value); updateBtn();
   }));
+  asofInput.addEventListener('change', () => {
+    asofInput.classList.toggle('need', !asofInput.value); updateBtn();
+  });
 
   function listEl(key) { return document.getElementById(key === 'hal' ? 'listHal' : 'listDetails'); }
+
+  // best-guess the company from the file name (levine.csv -> Levine, hal ttg.xlsx -> TTG)
+  function guessCompany(name) {
+    const n = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const c of COMPANIES) {
+      const key = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (key && n.includes(key)) return c;
+    }
+    return '';
+  }
 
   function setup(id) {
     const dz = document.getElementById(id);
@@ -187,9 +212,21 @@
   function add(key, fileList) {
     [...fileList].filter(f => /\.(csv|xlsx|xlsm)$/i.test(f.name)).forEach(f => {
       if (store[key].some(x => x.file.name === f.name && x.file.size === f.size)) return;
-      store[key].push({ file: f });
+      const entry = { file: f };
+      if (key === 'hal') entry.company = guessCompany(f.name);
+      store[key].push(entry);
     });
     render(key);
+  }
+
+  function selectHTML(options, selected, placeholder) {
+    let html = `<select class="sel-co${selected ? '' : ' need'}">`;
+    html += `<option value="" ${selected ? '' : 'selected'} disabled>${placeholder}</option>`;
+    options.forEach(o => {
+      const sel = o === selected ? 'selected' : '';
+      html += `<option value="${o.replace(/"/g, '&quot;')}" ${sel}>${o}</option>`;
+    });
+    return html + `</select>`;
   }
 
   function render(key) {
@@ -198,8 +235,15 @@
     store[key].forEach((entry, i) => {
       const row = document.createElement('div');
       row.className = 'file-row';
-      row.innerHTML = `<span class="fname" title="${entry.file.name}">${entry.file.name}</span>` +
-                      `<button class="remove" title="Remove">&times;</button>`;
+      let html = `<span class="fname" title="${entry.file.name}">${entry.file.name}</span>`;
+      if (key === 'hal') html += selectHTML(COMPANIES, entry.company, 'Company…');
+      html += `<button class="remove" title="Remove">&times;</button>`;
+      row.innerHTML = html;
+      if (key === 'hal') {
+        row.querySelector('.sel-co').addEventListener('change', e => {
+          entry.company = e.target.value; e.target.classList.toggle('need', !entry.company); updateBtn();
+        });
+      }
       row.querySelector('.remove').addEventListener('click', () => { store[key].splice(i, 1); render(key); });
       list.appendChild(row);
     });
@@ -207,7 +251,10 @@
   }
 
   function ready() {
-    return leagueSel.value && yearSel.value && store.hal.length > 0 && store.details.length > 0;
+    if (!leagueSel.value || !yearSel.value || !asofInput.value) return false;
+    if (!store.hal.length || !store.details.length) return false;
+    if (store.hal.some(e => !e.company)) return false;
+    return true;
   }
   function updateBtn() { processBtn.disabled = !ready(); }
 
@@ -236,7 +283,8 @@
     const fd = new FormData();
     fd.append('league', leagueSel.value);
     fd.append('year', yearSel.value);
-    store.hal.forEach(e => fd.append('hal', e.file));
+    fd.append('as_of', asofInput.value);
+    store.hal.forEach(e => { fd.append('hal', e.file); fd.append('hal_company', e.company); });
     store.details.forEach(e => fd.append('details', e.file));
 
     try {
@@ -266,7 +314,7 @@
             <div class="stat"><div class="num ${d.not_reconciled ? 'bad' : ''}">${d.not_reconciled}</div><div class="lbl">Not Reconciled</div></div>
           </div>
           <div class="reports">
-            <div class="reports-head">${d.companies} report${d.companies === 1 ? '' : 's'} &middot; ${esc(d.league)} &middot; ${esc(d.year)}</div>
+            <div class="reports-head">${d.companies} report${d.companies === 1 ? '' : 's'} &middot; ${esc(d.league)} &middot; ${esc(d.year)} &middot; as of ${esc(d.as_of)}</div>
             ${reportRows}
           </div>
           <div class="download-wrap"><a class="btn-download" href="${d.download_all_url}">${d.companies > 1 ? 'Download all reports (ZIP)' : 'Download Reconciliation Workbook'}</a></div>`;

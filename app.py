@@ -37,6 +37,7 @@ import time
 import uuid
 import zipfile
 import tempfile
+import datetime as dt
 from collections import defaultdict, OrderedDict
 
 from flask import Flask, request, jsonify, send_file, send_from_directory, abort
@@ -50,9 +51,206 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORE_DIR = os.path.join(tempfile.gettempdir(), "recon_store")
 os.makedirs(STORE_DIR, exist_ok=True)
 
+MAPPING_FILE = os.path.join(BASE_DIR, "Master_Mapping_List.xlsx")
+EXCLUDE_COMPANIES = {"needle", "damona"}
+
+
+def load_company_names():
+    """Company/broker Short Names for the per-file dropdown, from the Master
+    Mapping List (col 'Short Name'). Falls back to a built-in list."""
+    try:
+        wb = load_workbook(MAPPING_FILE, data_only=True, read_only=True)
+        ws = wb.worksheets[0]
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+        header = [str(c or "").strip().lower() for c in rows[0]]
+        ci = header.index("short name") if "short name" in header else 1
+        names, seen = [], set()
+        for r in rows[1:]:
+            v = str(r[ci]).strip() if ci < len(r) and r[ci] else ""
+            if v and v.lower() not in EXCLUDE_COMPANIES and v not in seen:
+                seen.add(v)
+                names.append(v)
+        if names:
+            return names
+    except Exception:
+        pass
+    return ["TTG", "Y&S", "YourTix", "Asher", "Chase", "Katz", "Levine",
+            "Levovitz", "TL", "GK", "Grossman", "Pollak", "Sternbuch", "Waxler"]
+
+
+COMPANY_NAMES = load_company_names()
+
+# Secondary-market vendors to exclude from Purchase Details before reconciling.
+EXCLUDED_VENDORS = ("ticketmaster", "tickpick", "stubhub", "ticket evolution", "gotickets")
+
+
+def load_broker_pvcompanies():
+    """From the Master Mapping List, map each broker Short Name to the set of
+    TicketVault 'Company' values that belong to it (col 'TicketVault Company /
+    Applied Payments Category'). Returns (broker->set(pv_company_lower),
+    pv_company_lower->broker)."""
+    broker_to_pv, pv_to_broker = {}, {}
+    try:
+        wb = load_workbook(MAPPING_FILE, data_only=True, read_only=True)
+        rows = list(wb.worksheets[0].iter_rows(values_only=True))
+        wb.close()
+        header = [str(c or "").strip().lower() for c in rows[0]]
+        si = header.index("short name") if "short name" in header else 1
+        ti = next((i for i, h in enumerate(header) if h.startswith("ticketvault company")), 3)
+        for r in rows[1:]:
+            short = str(r[si]).strip() if si < len(r) and r[si] else ""
+            pv = str(r[ti]).strip().lower() if ti < len(r) and r[ti] else ""
+            if not short or not pv or short.lower() in EXCLUDE_COMPANIES:
+                continue
+            broker_to_pv.setdefault(short, set()).add(pv)
+            pv_to_broker[pv] = short
+    except Exception:
+        pass
+    return broker_to_pv, pv_to_broker
+
+
+BROKER_PVCOMPANIES, PVCOMPANY_TO_BROKER = load_broker_pvcompanies()
+
+
+def _is_excluded_vendor(vendor):
+    v = str(vendor or "").strip().lower()
+    return any(v.startswith(x) for x in EXCLUDED_VENDORS)
+
+# --------------------------------------------------------------------------- #
+# Team-name normalization
+#
+# Brokers write team names every which way — "Bengals", "CIN", "49ers", full
+# "Cincinnati Bengals". TicketVault uses the full "City Nickname". We map both
+# sides to that canonical form, scoped by the League chosen in the UI (so
+# "Cardinals" -> Arizona under NFL). Nicknames and single-team cities are
+# derived automatically from each league's team list; abbreviations and
+# historical/edge aliases are listed explicitly. Leagues without a list here
+# pass through unchanged.
+# --------------------------------------------------------------------------- #
+
+NFL_TEAMS = [
+    "Arizona Cardinals", "Atlanta Falcons", "Baltimore Ravens", "Buffalo Bills",
+    "Carolina Panthers", "Chicago Bears", "Cincinnati Bengals", "Cleveland Browns",
+    "Dallas Cowboys", "Denver Broncos", "Detroit Lions", "Green Bay Packers",
+    "Houston Texans", "Indianapolis Colts", "Jacksonville Jaguars", "Kansas City Chiefs",
+    "Las Vegas Raiders", "Los Angeles Chargers", "Los Angeles Rams", "Miami Dolphins",
+    "Minnesota Vikings", "New England Patriots", "New Orleans Saints", "New York Giants",
+    "New York Jets", "Philadelphia Eagles", "Pittsburgh Steelers", "San Francisco 49ers",
+    "Seattle Seahawks", "Tampa Bay Buccaneers", "Tennessee Titans", "Washington Commanders",
+]
+NFL_ALIASES = {
+    "ari": "Arizona Cardinals", "arz": "Arizona Cardinals", "atl": "Atlanta Falcons",
+    "bal": "Baltimore Ravens", "blt": "Baltimore Ravens", "buf": "Buffalo Bills",
+    "car": "Carolina Panthers", "chi": "Chicago Bears", "cin": "Cincinnati Bengals",
+    "cle": "Cleveland Browns", "dal": "Dallas Cowboys", "den": "Denver Broncos",
+    "det": "Detroit Lions", "gb": "Green Bay Packers", "gnb": "Green Bay Packers",
+    "hou": "Houston Texans", "ind": "Indianapolis Colts", "jax": "Jacksonville Jaguars",
+    "jac": "Jacksonville Jaguars", "jags": "Jacksonville Jaguars", "kc": "Kansas City Chiefs",
+    "kan": "Kansas City Chiefs", "lv": "Las Vegas Raiders", "lvr": "Las Vegas Raiders",
+    "oak": "Las Vegas Raiders", "oakland": "Las Vegas Raiders", "raiders": "Las Vegas Raiders",
+    "lac": "Los Angeles Chargers", "sd": "Los Angeles Chargers", "san diego": "Los Angeles Chargers",
+    "lar": "Los Angeles Rams", "st louis rams": "Los Angeles Rams", "mia": "Miami Dolphins",
+    "min": "Minnesota Vikings", "ne": "New England Patriots", "nwe": "New England Patriots",
+    "pats": "New England Patriots", "no": "New Orleans Saints", "nor": "New Orleans Saints",
+    "nyg": "New York Giants", "nyj": "New York Jets", "phi": "Philadelphia Eagles",
+    "pit": "Pittsburgh Steelers", "sf": "San Francisco 49ers", "sfo": "San Francisco 49ers",
+    "niners": "San Francisco 49ers", "sea": "Seattle Seahawks", "tb": "Tampa Bay Buccaneers",
+    "tbb": "Tampa Bay Buccaneers", "bucs": "Tampa Bay Buccaneers", "ten": "Tennessee Titans",
+    "was": "Washington Commanders", "wsh": "Washington Commanders",
+    "washington football team": "Washington Commanders", "redskins": "Washington Commanders",
+}
+MLB_TEAMS = [
+    "Arizona Diamondbacks", "Atlanta Braves", "Baltimore Orioles", "Boston Red Sox",
+    "Chicago Cubs", "Chicago White Sox", "Cincinnati Reds", "Cleveland Guardians",
+    "Colorado Rockies", "Detroit Tigers", "Houston Astros", "Kansas City Royals",
+    "Los Angeles Angels", "Los Angeles Dodgers", "Miami Marlins", "Milwaukee Brewers",
+    "Minnesota Twins", "New York Mets", "New York Yankees", "Oakland Athletics",
+    "Philadelphia Phillies", "Pittsburgh Pirates", "San Diego Padres", "San Francisco Giants",
+    "Seattle Mariners", "St. Louis Cardinals", "Tampa Bay Rays", "Texas Rangers",
+    "Toronto Blue Jays", "Washington Nationals",
+]
+NBA_TEAMS = [
+    "Atlanta Hawks", "Boston Celtics", "Brooklyn Nets", "Charlotte Hornets",
+    "Chicago Bulls", "Cleveland Cavaliers", "Dallas Mavericks", "Denver Nuggets",
+    "Detroit Pistons", "Golden State Warriors", "Houston Rockets", "Indiana Pacers",
+    "Los Angeles Clippers", "Los Angeles Lakers", "Memphis Grizzlies", "Miami Heat",
+    "Milwaukee Bucks", "Minnesota Timberwolves", "New Orleans Pelicans", "New York Knicks",
+    "Oklahoma City Thunder", "Orlando Magic", "Philadelphia 76ers", "Phoenix Suns",
+    "Portland Trail Blazers", "Sacramento Kings", "San Antonio Spurs", "Toronto Raptors",
+    "Utah Jazz", "Washington Wizards",
+]
+NHL_TEAMS = [
+    "Anaheim Ducks", "Boston Bruins", "Buffalo Sabres", "Calgary Flames",
+    "Carolina Hurricanes", "Chicago Blackhawks", "Colorado Avalanche", "Columbus Blue Jackets",
+    "Dallas Stars", "Detroit Red Wings", "Edmonton Oilers", "Florida Panthers",
+    "Los Angeles Kings", "Minnesota Wild", "Montreal Canadiens", "Nashville Predators",
+    "New Jersey Devils", "New York Islanders", "New York Rangers", "Ottawa Senators",
+    "Philadelphia Flyers", "Pittsburgh Penguins", "San Jose Sharks", "Seattle Kraken",
+    "St. Louis Blues", "Tampa Bay Lightning", "Toronto Maple Leafs", "Utah Hockey Club",
+    "Vancouver Canucks", "Vegas Golden Knights", "Washington Capitals", "Winnipeg Jets",
+]
+
+
+def _build_team_index(full_names, extra_aliases):
+    """canonical lookup: alias(lowercased) -> full team name. Nicknames and
+    unambiguous cities are derived from the team list automatically."""
+    alias, nick, city = {}, {}, {}
+    for full in full_names:
+        parts = full.split()
+        alias[full.lower()] = full
+        nick.setdefault(parts[-1].lower(), []).append(full)
+        city.setdefault(" ".join(parts[:-1]).lower(), []).append(full)
+    for key, teams in nick.items():
+        if len(teams) == 1:
+            alias[key] = teams[0]
+    for key, teams in city.items():
+        if key and len(teams) == 1:
+            alias[key] = teams[0]
+    for a, full in extra_aliases.items():   # explicit wins over derived
+        alias[a.lower()] = full
+    return alias
+
+
+TEAM_INDEX = {
+    "NFL": _build_team_index(NFL_TEAMS, NFL_ALIASES),
+    "MLB": _build_team_index(MLB_TEAMS, {}),
+    "NBA": _build_team_index(NBA_TEAMS, {}),
+    "NHL": _build_team_index(NHL_TEAMS, {}),
+}
+
+
+def _normalize_team(name, league):
+    lc = re.sub(r"\s+", " ", str(name or "").strip()).lower()
+    if not lc:
+        return ""
+    idx = TEAM_INDEX.get(league, {})
+    return idx.get(lc, str(name).strip())
+
 DEFAULT_TOLERANCE = 1.00  # dollars; TV total must tie to HAL total within this
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
+
+# Different companies label their HAL columns differently. Each HAL field maps to
+# every header name we've seen for it (case-insensitive). To support a new company
+# whose layout differs, add its header names to the relevant list here.
+HAL_SYNONYMS = {
+    "company": ["Company", "Client", "Broker", "Group"],
+    "email":   ["Email", "Account Email", "Email Address", "Login Email",
+                "Email (from Profiles)", "Account EMAIL", "user Name/email",
+                "Username/Email", "User Name/Email", "PO Email Account"],
+    "team":    ["Team", "Team Name"],
+    "fp":      ["Full/Partial", "Type", "Plan", "Plan Type", "Ticket Type",
+                "Package", "Plan/Parking"],
+    "section": ["Section", "Sec", "Sec.", "Sction"],
+    "row":     ["Row"],
+    "seats":   ["Seats", "Seat", "Seat(s)", "Seat Range", "Seat #", "Seat Numbers"],
+    "qty":     ["Qty", "Quantity", "# Seats", "Seat Qty", "# of Seats"],
+    "games":   ["Games/Threshold", "Games Threshold", "# Games", "Games", "Games#",
+                "# of Games", "Num Games", "Game Count"],
+    "total":   ["Total", "Total Cost", "Total Price", "Total Amount", "Cost",
+                "Amount Paid", "Amount $", "Amount ($)", "Amount"],
+}
 
 # --------------------------------------------------------------------------- #
 # Generic helpers
@@ -171,6 +369,11 @@ def _row(cell):
 
 
 def _seatnums(cell):
+    # Excel silently turns seat ranges like "3-9" into a date (Mar 9). Recover
+    # them as month-day -> seat range (verified against Qty in real exports).
+    if isinstance(cell, (dt.datetime, dt.date)):
+        lo, hi = sorted((cell.month, cell.day))
+        return set(range(lo, hi + 1))
     s = str(cell or "").replace(" ", "")
     m = re.match(r"^(\d+)-(\d+)$", s)
     if m:
@@ -182,70 +385,138 @@ def _seatnums(cell):
     return set()
 
 
+def _seat_text(cell):
+    """Readable seat string. Excel turns ranges like '3-9' into a date (Mar 9);
+    render those back as 'month-day' so both display and matching are correct."""
+    if isinstance(cell, (dt.datetime, dt.date)):
+        return f"{cell.month}-{cell.day}"
+    return str(cell or "").strip()
+
+
 def _is_parking_hal(full_partial):
     return "parking" in str(full_partial or "").lower()
+
+
+# Plan/Type values that mean the seats aren't actually held this season and so
+# shouldn't be reconciled. (You may also strip these before uploading.)
+NONACTIVE_KEYWORDS = ("deposit", "wait list", "waitlist", "waitlisted", "inquir",
+                      "notification", "cancel", "nothing for this", "back and forth",
+                      "pending", "declined", "not renew")
+
+
+def _is_nonactive(full_partial):
+    s = str(full_partial or "").lower()
+    return any(k in s for k in NONACTIVE_KEYWORDS)
 
 
 def _is_parking_pv(sec, row):
     return ("LOT" in sec) or ("PARKING" in row) or ("PARKING" in sec)
 
 
+_EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
+
+
+def _year_tokens(year):
+    m = re.match(r"^(\d{4})-(\d{2})$", str(year or "").strip())
+    return (m.group(1), m.group(1)[2:], m.group(2)) if m else None
+
+
+def _year_total_cols(year):
+    """Some HALs keep total cost in a season-year column: Levovitz '26/27',
+    GK '26 Total'. Build those names from the selected year."""
+    t = _year_tokens(year)
+    if not t:
+        return []
+    yyyy, yy, nn = t
+    return [f"{yy} Total", f"{yyyy} Total", f"{yy}/{nn}", f"{yy}-{nn}"]
+
+
+def _year_plan_cols(year):
+    """Some HALs name the plan/type column by year (GK '2026 Plan')."""
+    t = _year_tokens(year)
+    if not t:
+        return []
+    yyyy, yy, _nn = t
+    return [f"{yyyy} Plan", f"{yy} Plan"]
+
+
+def _sniff_email_col(header, data_rows):
+    """When no email header matches (GK stores it under 'Profiles', TL under
+    'Name'), pick the column whose values most look like email addresses."""
+    best_i, best_frac = None, 0.0
+    sample = data_rows[:200]
+    for i in range(len(header)):
+        vals = [r[i] for r in sample if i < len(r) and r[i] not in (None, "")]
+        if not vals:
+            continue
+        frac = sum(1 for v in vals if _EMAIL_RE.search(str(v))) / len(vals)
+        if frac > best_frac:
+            best_i, best_frac = i, frac
+    return best_i if best_frac >= 0.5 else None
+
+
 # --------------------------------------------------------------------------- #
 # Parsing
 # --------------------------------------------------------------------------- #
 
-def parse_hal(rows, filename):
-    """Parse the HAL-NFL season-ticket database. One record per seat block.
-    Each record is tagged with its Company (from a 'Company' column if present,
-    otherwise the file name)."""
+def parse_hal(rows, filename, company, year="", league=""):
+    """Parse a HAL season-ticket database. One record per seat block. Column
+    names vary by company and are matched via HAL_SYNONYMS (email is also
+    sniffed from values). Team names are normalized to TicketVault's canonical
+    form for the chosen league. Non-active rows (deposits, waitlist, inquiries)
+    are dropped. Returns (records, excluded_count)."""
     hidx, header = _find_header_row(rows)
-    ci = {
-        "company": _col_index(header, "Company", "Client", "Broker"),
-        "email": _col_index(header, "Email"),
-        "team": _col_index(header, "Team"),
-        "fp": _col_index(header, "Full/Partial"),
-        "section": _col_index(header, "Section"),
-        "row": _col_index(header, "Row"),
-        "seats": _col_index(header, "Seats"),
-        "qty": _col_index(header, "Qty"),
-        "games": _col_index(header, "Games/Threshold", "# Games", "Games"),
-        "total": _col_index(header, "Total", "Total Cost"),
-    }
+    ci = {field: _col_index(header, *names) for field, names in HAL_SYNONYMS.items()}
+    data_rows = rows[hidx + 1:]
+    if ci["email"] is None:
+        ci["email"] = _sniff_email_col(header, data_rows)
     if ci["email"] is None or ci["team"] is None:
-        raise ValueError(f"{os.path.basename(filename)}: HAL file is missing an "
-                         f"'Email' or 'Team' column.")
-    default_company = _company_from_filename(filename)
-    out = []
-    for row in rows[hidx + 1:]:
-        team = _team(_cell(row, ci["team"]))
+        raise ValueError(
+            f"{os.path.basename(filename)}: couldn't find an email or team column. "
+            f"Looked for email as {HAL_SYNONYMS['email']} (and by sniffing values) "
+            f"and team as {HAL_SYNONYMS['team']}. Add this file's header names to "
+            f"HAL_SYNONYMS.")
+    if ci["total"] is None:
+        ci["total"] = _col_index(header, *_year_total_cols(year))
+    if ci["fp"] is None:
+        ci["fp"] = _col_index(header, *_year_plan_cols(year))
+    out, excluded = [], 0
+    for row in data_rows:
+        team = _normalize_team(_cell(row, ci["team"]), league)
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
             continue
-        company = str(_cell(row, ci["company"]) or "").strip() or default_company
+        fp = str(_cell(row, ci["fp"]) or "").strip()
+        if _is_nonactive(fp):
+            excluded += 1
+            continue
         games = _amount(_cell(row, ci["games"]))
         out.append({
             "company": company,
             "emails": emails,
             "team": team,
-            "Full/Partial": str(_cell(row, ci["fp"]) or "").strip(),
+            "Full/Partial": fp,
             "Section": str(_cell(row, ci["section"]) or "").strip(),
             "Row": str(_cell(row, ci["row"]) or "").strip(),
-            "Seats": str(_cell(row, ci["seats"]) or "").strip(),
+            "Seats": _seat_text(_cell(row, ci["seats"])),
             "Qty": str(_cell(row, ci["qty"]) or "").strip(),
             "Email": str(_cell(row, ci["email"]) or "").strip(),
             "games": int(games) if games is not None else None,
             "total": _amount(_cell(row, ci["total"])) or 0.0,
             "sec_n": _sec(_cell(row, ci["section"])),
             "row_n": _row(_cell(row, ci["row"])),
-            "is_parking": _is_parking_hal(_cell(row, ci["fp"])),
+            "is_parking": _is_parking_hal(fp),
         })
-    return out
+    return out, excluded
 
 
-def parse_details(rows, filename):
-    """Parse a TicketVault Purchase Details export into an index keyed by
-    (email, team) -> list of {sec, row, seatset, event, cost, is_parking}."""
+def parse_details(rows, filename, league=""):
+    """Parse a TicketVault Purchase Details export. Returns
+    (parsed_rows, header, kept, excluded_vendor) where each parsed row carries
+    its normalized team, seat data, company (for scoping), and the original row
+    (for the source tab). Secondary-market vendors are dropped."""
     hidx, header = _find_header_row(rows)
+    raw_header = list(rows[hidx]) if hidx < len(rows) else []
     ci = {
         "email": _col_index(header, "PO Email Account", "Email"),
         "team": _col_index(header, "Team/Performer", "Team"),
@@ -254,29 +525,33 @@ def parse_details(rows, filename):
         "seats": _col_index(header, "Seats"),
         "event": _col_index(header, "Event Date"),
         "cost": _col_index(header, "Total Cost"),
+        "company": _col_index(header, "Company"),
+        "vendor": _col_index(header, "Vendor"),
     }
     if ci["email"] is None or ci["team"] is None or ci["cost"] is None:
         raise ValueError(f"{os.path.basename(filename)}: Purchase Details file is "
                          f"missing 'PO Email Account', 'Team/Performer' or 'Total Cost'.")
-    index = defaultdict(list)
-    n = 0
+    parsed, excluded_vendor = [], 0
     for row in rows[hidx + 1:]:
         email = str(_cell(row, ci["email"]) or "").strip().lower()
-        team = _team(_cell(row, ci["team"]))
+        team = _normalize_team(_cell(row, ci["team"]), league)
         if not email or not team:
+            continue
+        if _is_excluded_vendor(_cell(row, ci["vendor"])):
+            excluded_vendor += 1
             continue
         sec = _sec(_cell(row, ci["sec"]))
         rw = _row(_cell(row, ci["row"]))
-        index[(email, team)].append({
-            "sec": sec,
-            "row": rw,
+        parsed.append({
+            "email": email, "team": team, "sec": sec, "row": rw,
             "seatset": _seatnums(_cell(row, ci["seats"])),
             "event": str(_cell(row, ci["event"]) or ""),
             "cost": _amount(_cell(row, ci["cost"])) or 0.0,
             "is_parking": _is_parking_pv(sec, rw),
+            "company_norm": str(_cell(row, ci["company"]) or "").strip().lower(),
+            "raw": list(row),
         })
-        n += 1
-    return index, n
+    return parsed, raw_header, len(parsed), excluded_vendor
 
 
 # --------------------------------------------------------------------------- #
@@ -297,25 +572,25 @@ def _games_split(matches):
     return wc, woc, round(total, 2)
 
 
-def reconcile(hal_rows, index, tolerance):
+def reconcile(hal_rows, primary_index, secondary_index, tolerance):
     reconciled, not_reconciled = [], []
     for r in hal_rows:
+        own = set(r["emails"])
         vr = []
         for e in r["emails"]:
-            vr.extend(index.get((e, r["team"]), []))
+            vr.extend(primary_index.get((e, r["team"]), []))
 
         if not vr:
-            matches = []
+            own_matches = []
         elif r["is_parking"]:
-            matches = [x for x in vr if x["is_parking"]]
+            own_matches = [x for x in vr if x["is_parking"]]
         else:
             hs = _seatnums(r["Seats"])
-            matches = [x for x in vr if (not x["is_parking"])
-                       and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
-                       and (x["seatset"] & hs)]
+            own_matches = [x for x in vr if (not x["is_parking"])
+                           and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
+                           and (x["seatset"] & hs)]
 
-        wc, woc, tv_cost = _games_split(matches)
-
+        wc, woc, tv_cost = _games_split(own_matches)
         base = {
             "Team": r["team"], "Email": r["Email"], "Full/Partial": r["Full/Partial"],
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
@@ -323,21 +598,52 @@ def reconcile(hal_rows, index, tolerance):
             "TV Total Cost": tv_cost, "# Games w/Cost": wc, "# Games w/o Cost": woc,
         }
 
-        if not matches:
-            not_reconciled.append({**base, "Notes": "Not bought in", "_p": 0})
-            continue
+        def variances(tvc, games_wc, alt_email=""):
+            return {
+                "Var Total Cost": round(tvc - r["total"], 2),
+                "Var # Games w/Cost": (games_wc - r["games"]) if r["games"] is not None else None,
+                "Var Email Address": alt_email,
+            }
 
-        cost_ok = abs(tv_cost - r["total"]) <= tolerance
-        games_ok = (r["games"] is not None and wc == r["games"])
-        if cost_ok and games_ok:
-            reconciled.append(base)
-        else:
+        if own_matches:
+            cost_ok = abs(tv_cost - r["total"]) <= tolerance
+            games_known = r["games"] is not None
+            games_ok = games_known and wc == r["games"]
+            if cost_ok and games_ok:
+                reconciled.append(base)
+                continue
             parts = []
             if not cost_ok:
                 parts.append("total cost not equal")
             if not games_ok:
-                parts.append("# games not equal")
-            not_reconciled.append({**base, "Notes": ", ".join(parts), "_p": 1})
+                parts.append("# games not equal" if games_known else "# games not in HAL")
+            not_reconciled.append({**base, **variances(tv_cost, wc),
+                                    "Notes": ", ".join(parts), "_p": 1})
+            continue
+
+        # nothing under the account's own email — look for the same seats under a
+        # DIFFERENT email in this broker's vault (same team/sec/row, seat overlap)
+        if not r["is_parking"]:
+            hs = _seatnums(r["Seats"])
+            cands = secondary_index.get((r["team"], r["sec_n"], r["row_n"]), [])
+            by_email = defaultdict(list)
+            for x in cands:
+                if x["email"] not in own and (x["seatset"] & hs):
+                    by_email[x["email"]].append(x)
+            for alt_email, ms in by_email.items():
+                a_wc, a_woc, a_cost = _games_split(ms)
+                cost_ok = abs(a_cost - r["total"]) <= tolerance
+                games_ok = (r["games"] is None) or (a_wc == r["games"])
+                if cost_ok and games_ok:
+                    alt = {**base, "TV Total Cost": a_cost,
+                           "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
+                    not_reconciled.append({**alt, **variances(a_cost, a_wc, alt_email),
+                                           "Notes": "different email address", "_p": 2})
+                    break
+            else:
+                not_reconciled.append({**base, **variances(0.0, 0), "Notes": "Not bought in", "_p": 0})
+        else:
+            not_reconciled.append({**base, **variances(0.0, 0), "Notes": "Not bought in", "_p": 0})
 
     reconciled.sort(key=lambda x: (x["Team"], x["Email"]))
     not_reconciled.sort(key=lambda x: (x["_p"], -x["HAL Total Cost"]))
@@ -353,6 +659,7 @@ CUR = "$#,##0"
 THIN = Side(style="thin", color="000000")
 HAL_FILL = PatternFill("solid", fgColor=Color(theme=8, tint=0.7999816888943144))
 TV_FILL = PatternFill("solid", fgColor=Color(theme=8, tint=0.0))
+VAR_FILL = PatternFill("solid", fgColor="FFC000")
 NAVY = "1F3864"
 BLUE = "2E5496"
 CENTER = Alignment(horizontal="center")
@@ -362,27 +669,35 @@ RECON_COLS = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
 RECON_SRC = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
              "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost"]
 RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0]
+RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12)]
+RECON_COST = {9, 10}
 
 NR_COLS = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
-           "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost"]
+           "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
+           "Total Cost", "# Games w/Cost", "Email Address"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
-          "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost"]
-NR_W = [35.7, 20.0, 28.6, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 20.1, 22.0]
+          "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
+          "Var Total Cost", "Var # Games w/Cost", "Var Email Address"]
+NR_W = [26.0, 20.0, 28.6, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 20.1, 22.0,
+        13.0, 15.0, 30.0]
+NR_BANDS = [("per HAL", HAL_FILL, 1, 10), ("per TicketVault", TV_FILL, 11, 13),
+            ("Variances", VAR_FILL, 14, 16)]
+NR_COST = {10, 11, 14}
 
 
-def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_last, cost_cols):
+def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols):
     ws.sheet_view.showGridLines = False
     for j, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(j)].width = w
     n = len(headers)
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=hal_last)
-    ws.merge_cells(start_row=1, start_column=tv_first, end_row=1, end_column=tv_last)
-    a = ws.cell(1, 1, "per HAL"); a.font = Font(name=ARIAL, size=9, bold=True); a.alignment = CENTER; a.fill = HAL_FILL
-    b = ws.cell(1, tv_first, "per TicketVault"); b.font = Font(name=ARIAL, size=9, bold=True); b.alignment = CENTER; b.fill = TV_FILL
-    for c in range(1, hal_last + 1):
-        ws.cell(1, c).fill = HAL_FILL
-    for c in range(tv_first, tv_last + 1):
-        ws.cell(1, c).fill = TV_FILL
+    for label, fill, first, last in bands:
+        ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
+        dark = fill is not VAR_FILL
+        c = ws.cell(1, first, label)
+        c.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF" if dark else "000000")
+        c.alignment = CENTER
+        for cc in range(first, last + 1):
+            ws.cell(1, cc).fill = fill
     for j, h in enumerate(headers, 1):
         cell = ws.cell(2, j, h); cell.font = Font(name=ARIAL, size=10, bold=True); cell.alignment = CENTER
     for i, r in enumerate(rows, 3):
@@ -392,21 +707,59 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, hal_last, tv_first, tv_la
             if j in cost_cols:
                 cell.number_format = CUR
     end = 2 + len(rows)
+    lefts = {b[2] for b in bands}
+    rights = {b[3] for b in bands}
     for rr in range(1, end + 1):
-        ws.cell(rr, 1).border = Border(left=THIN, right=(THIN if rr == 1 else None))
-        ws.cell(rr, hal_last).border = Border(right=THIN)
-        ws.cell(rr, tv_first).border = Border(left=(THIN if rr == 1 else None),
-                                              right=(THIN if rr == 1 else None))
-        ws.cell(rr, tv_last).border = Border(right=THIN)
+        for col in lefts:
+            ws.cell(rr, col).border = Border(left=THIN, right=ws.cell(rr, col).border.right)
+        for col in rights:
+            ws.cell(rr, col).border = Border(left=ws.cell(rr, col).border.left, right=THIN)
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{get_column_letter(n)}{end}"
 
 
-def build_workbook(company, league, year, reconciled, not_reconciled, hal_total, tolerance):
+def _src_val(v):
+    if v is None or isinstance(v, (str, int, float, bool, dt.datetime, dt.date)):
+        return v
+    return str(v)
+
+
+def _build_source_tab(ws, header, blocks):
+    """Dump raw source rows (header + data). `blocks` is a list of (header, rows)
+    so multiple files for one company stack. `header` is a fallback header."""
+    ws.sheet_view.showGridLines = False
+    max_cols = 1
+    r = 1
+    first = True
+    for blk_header, blk_rows in blocks:
+        hdr = blk_header or header
+        for j, h in enumerate(hdr, 1):
+            cell = ws.cell(r, j, _src_val(h))
+            cell.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor=NAVY); cell.alignment = CENTER
+        max_cols = max(max_cols, len(hdr))
+        hdr_row = r
+        r += 1
+        for row in blk_rows:
+            for j, v in enumerate(row, 1):
+                ws.cell(r, j, _src_val(v)).font = Font(name=ARIAL, size=9)
+            r += 1
+        if first:
+            ws.freeze_panes = f"A{hdr_row + 1}"
+            ws.auto_filter.ref = f"A{hdr_row}:{get_column_letter(max(max_cols, 1))}{r - 1}"
+            first = False
+        r += 1  # blank row between stacked files
+    for j in range(1, max_cols + 1):
+        ws.column_dimensions[get_column_letter(j)].width = 16
+
+
+def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
+                   hal_total, tolerance, hal_blocks, pv_header, pv_rows):
     rec_n = len(reconciled)
     nr_n = len(not_reconciled)
     nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not bought in")
-    part = nr_n - nbi
+    de = sum(1 for r in not_reconciled if r["Notes"] == "different email address")
+    mismatch = nr_n - nbi - de
 
     wb = Workbook()
 
@@ -427,6 +780,7 @@ def build_workbook(company, league, year, reconciled, not_reconciled, hal_total,
     info(3, f"Company:  {company}", 11, True)
     info(4, f"League:  {league}", 10, False)
     info(5, f"Year:  {year}", 10, False)
+    info(6, f"As Of:  {as_of}", 10, False)
 
     def bar(r, text):
         c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
@@ -443,30 +797,34 @@ def build_workbook(company, league, year, reconciled, not_reconciled, hal_total,
         for c in (ca, cb):
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
-    bar(7, "RESULT"); hd(8, "Metric", "Count")
-    line(9, "Reconciled", rec_n)
-    line(10, "Not Reconciled", nr_n)
-    line(11, "Total # HAL Records", hal_total, bold=True)
-    bar(13, "NOT RECONCILED — BY REASON"); hd(14, "Reason", "Count")
-    line(15, "Not bought in", nbi)
-    line(16, "Partially bought in", part)
-    line(17, "TOTAL", nr_n, bold=True)
+    bar(8, "RESULT"); hd(9, "Metric", "Count")
+    line(10, "Reconciled", rec_n)
+    line(11, "Not Reconciled", nr_n)
+    line(12, "Total # HAL Records", hal_total, bold=True)
+    bar(14, "NOT RECONCILED — BY REASON"); hd(15, "Reason", "Count")
+    line(16, "Not bought in", nbi)
+    line(17, "Different email address", de)
+    line(18, "Cost / games mismatch", mismatch)
+    line(19, "TOTAL", nr_n, bold=True)
 
     # ---- Reconciled ----------------------------------------------------- #
-    ws_r = wb.create_sheet("Reconciled")
-    _build_detail_tab(ws_r, RECON_COLS, RECON_SRC, RECON_W, reconciled,
-                      hal_last=9, tv_first=10, tv_last=12, cost_cols={9, 10})
+    _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
+                      reconciled, RECON_BANDS, RECON_COST)
 
     # ---- Not Reconciled ------------------------------------------------- #
-    ws_nr = wb.create_sheet("Not Reconciled")
-    _build_detail_tab(ws_nr, NR_COLS, NR_SRC, NR_W, not_reconciled,
-                      hal_last=10, tv_first=11, tv_last=13, cost_cols={10, 11})
+    _build_detail_tab(wb.create_sheet("Not Reconciled"), NR_COLS, NR_SRC, NR_W,
+                      not_reconciled, NR_BANDS, NR_COST)
+
+    # ---- Source data ---------------------------------------------------- #
+    _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks)
+    _build_source_tab(wb.create_sheet("Purchase Details"), pv_header, [(pv_header, pv_rows)])
 
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
     return bio.read(), {"reconciled": rec_n, "not_reconciled": nr_n,
-                        "not_bought_in": nbi, "partially": part, "clean": nr_n == 0}
+                        "not_bought_in": nbi, "different_email": de,
+                        "mismatch": mismatch, "clean": nr_n == 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -480,20 +838,24 @@ def index():
 
 @app.route("/options")
 def options():
-    return jsonify({"leagues": LEAGUES, "years": YEARS})
+    return jsonify({"leagues": LEAGUES, "years": YEARS, "companies": COMPANY_NAMES})
 
 
 @app.route("/process", methods=["POST"])
 def process():
     hal_files = [f for f in request.files.getlist("hal") if f.filename]
+    hal_companies = request.form.getlist("hal_company")
     details_files = [f for f in request.files.getlist("details") if f.filename]
     league = (request.form.get("league") or "").strip()
     year = (request.form.get("year") or "").strip()
+    as_of = (request.form.get("as_of") or "").strip()
 
     if league not in LEAGUES:
         return jsonify({"error": "Please choose a League."}), 400
     if year not in YEARS:
         return jsonify({"error": "Please choose a Year."}), 400
+    if not as_of:
+        return jsonify({"error": "Please choose an As Of Date."}), 400
     if not hal_files:
         return jsonify({"error": "Please upload at least one HAL season ticket database."}), 400
     if not details_files:
@@ -509,35 +871,56 @@ def process():
 
     warnings = []
     try:
-        hal_rows = []
-        for f in hal_files:
-            hal_rows.extend(parse_hal(_rows_from_upload(f.filename, f.read()), f.filename))
-        if not hal_rows:
+        # ---- HAL: records + raw source blocks, grouped by company ---------- #
+        hal_by_company = OrderedDict()
+        hal_src_by_company = {}
+        excluded_total = 0
+        for i, f in enumerate(hal_files):
+            company = (hal_companies[i] if i < len(hal_companies) else "").strip()
+            if not company:
+                return jsonify({"error": f"Choose a company for “{f.filename}”."}), 400
+            raw = _rows_from_upload(f.filename, f.read())
+            recs, excluded = parse_hal(raw, f.filename, company, year, league)
+            hal_by_company.setdefault(company, []).extend(recs)
+            hidx, _ = _find_header_row(raw)
+            hdr = raw[hidx] if hidx < len(raw) else []
+            hal_src_by_company.setdefault(company, []).append((hdr, raw[hidx + 1:]))
+            excluded_total += excluded
+        if not any(hal_by_company.values()):
             return jsonify({"error": "No season-ticket records found in the HAL file(s)."}), 400
+        if excluded_total:
+            warnings.append(f"Excluded {excluded_total} non-active row(s) "
+                            f"(deposits, waitlist, inquiries, cancellations) from the review.")
 
-        index = defaultdict(list)
-        detail_rows = 0
+        # ---- Purchase Details: parse, exclude vendors, scope by company ---- #
+        pv_parsed, pv_header, detail_rows, vendor_excluded = [], [], 0, 0
         for f in details_files:
-            part, n = parse_details(_rows_from_upload(f.filename, f.read()), f.filename)
-            for k, v in part.items():
-                index[k].extend(v)
-            detail_rows += n
+            parsed, hdr, kept, vex = parse_details(_rows_from_upload(f.filename, f.read()),
+                                                   f.filename, league)
+            pv_parsed.extend(parsed)
+            if hdr:
+                pv_header = hdr
+            detail_rows += kept
+            vendor_excluded += vex
         if detail_rows == 0:
-            return jsonify({"error": "No rows found in the Purchase Details file(s)."}), 400
+            return jsonify({"error": "No usable rows found in the Purchase Details file(s)."}), 400
+        if vendor_excluded:
+            warnings.append(f"Excluded {vendor_excluded} Purchase-Details row(s) from "
+                            f"secondary-market vendors (Ticketmaster, TickPick, StubHub, "
+                            f"Ticket Evolution, GoTickets).")
 
-        hal_teams = {r["team"] for r in hal_rows}
-        pv_teams = {t for (_e, t) in index}
-        missing_teams = sorted(hal_teams - pv_teams)
-        if missing_teams:
-            shown = ", ".join(missing_teams[:6]) + ("…" if len(missing_teams) > 6 else "")
-            warnings.append(f"{len(missing_teams)} team(s) in HAL have no rows in any "
-                            f"Purchase Details file — those records will show as "
-                            f"“Not bought in”: {shown}")
-
-        # split records by company, one workbook per company
-        by_company = OrderedDict()
-        for r in hal_rows:
-            by_company.setdefault(r["company"], []).append(r)
+        # build a company-scoped vault per broker (Master Mapping List)
+        vault = {}   # broker -> {primary, secondary, raw}
+        for x in pv_parsed:
+            broker = PVCOMPANY_TO_BROKER.get(x["company_norm"])
+            if not broker:
+                continue
+            vb = vault.setdefault(broker, {"primary": defaultdict(list),
+                                           "secondary": defaultdict(list), "raw": []})
+            vb["primary"][(x["email"], x["team"])].append(x)
+            if not x["is_parking"]:
+                vb["secondary"][(x["team"], x["sec"], x["row"])].append(x)
+            vb["raw"].append(x["raw"])
 
         token = uuid.uuid4().hex
         folder = os.path.join(STORE_DIR, token)
@@ -545,17 +928,27 @@ def process():
 
         reports = []
         tot_rec = tot_nr = 0
-        for company, rows in by_company.items():
-            reconciled, not_reconciled = reconcile(rows, index, tolerance)
-            data, m = build_workbook(company, league, year, reconciled,
-                                     not_reconciled, len(rows), tolerance)
-            fname = f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - {_safe_name(year)}.xlsx"
+        for company, recs in hal_by_company.items():
+            vb = vault.get(company, {"primary": {}, "secondary": {}, "raw": []})
+            if not vb["raw"]:
+                mapped = BROKER_PVCOMPANIES.get(company)
+                warnings.append(f"No Purchase Details found for {company}"
+                                + (f" (expected TicketVault company: "
+                                   f"{', '.join(sorted(mapped))})" if mapped else
+                                   " — company not in the Master Mapping List")
+                                + " — all its records will show as “Not bought in”.")
+            reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
+            data, m = build_workbook(company, league, year, as_of, reconciled, not_reconciled,
+                                     len(recs), tolerance, hal_src_by_company.get(company, []),
+                                     pv_header, vb["raw"])
+            fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
+                     f"{_safe_name(year)} - As Of {_safe_name(as_of)}.xlsx")
             with open(os.path.join(folder, fname), "wb") as fh:
                 fh.write(data)
             tot_rec += m["reconciled"]
             tot_nr += m["not_reconciled"]
             reports.append({
-                "company": company, "records": len(rows),
+                "company": company, "records": len(recs),
                 "reconciled": m["reconciled"], "not_reconciled": m["not_reconciled"],
                 "clean": m["clean"], "filename": fname,
                 "download_url": f"/download/{token}/{fname}",
@@ -563,9 +956,9 @@ def process():
 
         reports.sort(key=lambda x: x["company"].lower())
 
-        # bundle all reports into a single zip when there's more than one company
         if len(reports) > 1:
-            zip_name = f"Seasons Review - {_safe_name(league)} - {_safe_name(year)}.zip"
+            zip_name = (f"Seasons Review - {_safe_name(league)} - {_safe_name(year)} - "
+                        f"As Of {_safe_name(as_of)}.zip")
             with zipfile.ZipFile(os.path.join(folder, zip_name), "w",
                                  zipfile.ZIP_DEFLATED) as zf:
                 for rep in reports:
@@ -580,10 +973,11 @@ def process():
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
+    total_records = sum(len(v) for v in hal_by_company.values())
     return jsonify({
-        "league": league, "year": year,
+        "league": league, "year": year, "as_of": as_of,
         "companies": len(reports),
-        "total_records": len(hal_rows), "reconciled": tot_rec, "not_reconciled": tot_nr,
+        "total_records": total_records, "reconciled": tot_rec, "not_reconciled": tot_nr,
         "clean": tot_nr == 0,
         "reports": reports,
         "download_all_url": download_all_url, "download_all_name": download_all_name,

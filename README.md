@@ -26,27 +26,54 @@ A record is **Reconciled** only when the amount ties **and** the games match.
 
 ## Companies, League & Year
 
-- **Company** — records are split by a **`Company`** column in the HAL file, and
-  **each company gets its own workbook**. If a HAL file has no `Company` column,
-  the whole file is treated as one company named after the file. This lets you
-  drop several companies' HAL lists in together and hand each company its report.
-- **League / Year** — chosen from dropdowns at the top (League: MLB, MLS, NBA,
-  NFL, NHL, NCAAF, NCAAB, WNBA, Racing · Year: 2025-26 … 2028-29). They apply to
-  the whole batch, appear on each **Summary** tab, and drive the file name.
+- **Company** — every uploaded HAL file gets a **Company dropdown** (the list is
+  the *Short Name* values from `Master_Mapping_List.xlsx`, which is bundled). The
+  app pre-fills a best guess from the file name; change it if wrong. Each company
+  gets **its own workbook**, and files that share a company merge into one report.
+- **League / Year / As Of Date** — chosen at the top. League (MLB…Racing), Year
+  (2025-26 … 2028-29), and an **As Of Date** picker. All three apply to the whole
+  batch, appear on each **Summary** tab, and drive the file name.
+- **Company scoping.** Each broker's HAL is reconciled **only** against the
+  Purchase-Details rows whose `Company` belongs to that broker, per the
+  *TicketVault Company* column of `Master_Mapping_List.xlsx` (e.g. Chase →
+  "Jacks YS", GK → "GK LLC").
 
 Output file name convention:
 
-    Seasons Review - {Company} - {League} - {Year}.xlsx
+    Seasons Review - {Company} - {League} - {Year} - As Of {date}.xlsx
 
 When more than one company is produced, all reports are also bundled into
-`Seasons Review - {League} - {Year}.zip`; the UI additionally offers a per-company
-download link for each report.
+`Seasons Review - {League} - {Year} - As Of {date}.zip`; the UI additionally
+offers a per-company download link for each report.
+
+## Different HAL layouts
+
+Every broker formats their HAL differently, so the app maps columns by a list of
+known header names per field (see `HAL_SYNONYMS` in `app.py`) rather than fixed
+positions. To support a new broker whose headers differ, add its column names to
+the relevant list there. Two quirks are handled automatically:
+
+- **Date-corrupted seats.** Excel turns ranges like `3-9` into a date (Mar 9);
+  the app converts those back to `month-day`.
+- **Year-column cost.** Some HALs keep the total in a season-year column (e.g.
+  Levovitz uses `26/27`); the app looks there when there's no plain total column,
+  using the selected Year. It also finds year-named plan columns (GK `2026 Plan`).
+- **Email not in an obvious column.** If no email header matches, the app finds
+  the column whose values look like email addresses (GK `Profiles`, TL `Name`).
+- **Team names.** Brokers write teams as nicknames or abbreviations
+  (`Bengals`, `49ers`, `ATL`); both sides are normalized to TicketVault's full
+  `City Nickname` for the selected League. Teams outside that league pass through
+  unchanged (so run each league as its own batch).
+- **Non-active rows** (deposits, waitlist, inquiries, cancellations) are dropped
+  from the review; the count is reported after processing.
+- **Secondary-market vendors** (Ticketmaster, TickPick, StubHub, Ticket Evolution,
+  GoTickets) are dropped from Purchase Details before reconciling.
 
 ## The UI
 
 - Two dropdowns — **League** and **Year**.
-- Two drop zones — **Season Ticket Database** (HAL) and **Purchase Details**
-  (TicketVault), each accepting one or more files.
+- Two drop zones — **Season Ticket Database** (HAL, with a Company dropdown per
+  file) and **Purchase Details** (TicketVault), each accepting one or more files.
 - Reconcile stays disabled until League, Year, and at least one file in each zone
   are set. After processing you get an overall verdict and counts, a per-company
   list with individual download links, and a **Download all (ZIP)** button.
@@ -59,11 +86,16 @@ download link for each report.
 - **Reconciled** — one row per reconciled HAL record. Columns grouped **per HAL**
   (Team, Email, Full/Partial, Section, Row, Seats, Qty, # Games, Total Cost) and
   **per TicketVault** (Total Cost, # Games w/Cost, # Games w/o Cost).
-- **Not Reconciled** — same columns preceded by a **Notes** column. Notes are:
+- **Not Reconciled** — same columns preceded by a **Notes** column, plus a gold
+  **Variances** section (Total Cost delta, # Games w/Cost delta, and the alternate
+  Email Address for different-email hits). Notes are:
   - **Not bought in** — no matching rows in TicketVault for that seat block.
   - **total cost not equal** — present, but the amounts differ by more than the tolerance.
   - **# games not equal** — present, but TicketVault games-with-cost ≠ HAL # games.
-  - **total cost not equal, # games not equal** — both.
+  - **# games not in HAL** — present, but the HAL has no game count to check against.
+  - **different email address** — the right seats/cost/games exist in TicketVault
+    but under a different email; that email is shown in the Variances section.
+  - combinations of the above are joined with a comma.
 
 ### How edge cases are handled
 
@@ -95,6 +127,7 @@ python app.py        # http://localhost:5000
 | File | Purpose |
 |------|---------|
 | `app.py` | Flask backend — parsing, per-company reconciliation, workbook builder |
-| `index.html` | Single-page UI: League/Year dropdowns + two drop zones |
+| `index.html` | Single-page UI: League/Year dropdowns + per-file Company dropdowns |
+| `Master_Mapping_List.xlsx` | Source of the Company dropdown (Short Name column) |
 | `requirements.txt` | Python dependencies |
 | `Procfile` / `railway.json` | Start command for Railway |
