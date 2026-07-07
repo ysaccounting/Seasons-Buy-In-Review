@@ -665,7 +665,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             cost_ok = abs(tv_cost - r["total"]) <= tolerance
             games_known = r["games"] is not None
             if zero_parking:
-                games_ok = (not games_known) or (woc >= r["games"])
+                games_ok = games_known and woc == r["games"]
             else:
                 games_ok = games_known and wc == r["games"]
             if cost_ok and games_ok:
@@ -675,8 +675,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             if not cost_ok:
                 parts.append("total cost not equal")
             if not games_ok:
-                parts.append("# games not in HAL"
-                             if (not games_known and not zero_parking) else "# games not equal")
+                parts.append("# games not in HAL" if not games_known else "# games not equal")
             not_reconciled.append({**base, **variances(tv_cost, wc, woc),
                                     "Notes": ", ".join(parts), "_p": 1})
             continue
