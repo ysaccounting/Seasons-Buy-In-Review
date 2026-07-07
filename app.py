@@ -423,8 +423,21 @@ def _seat_text(cell):
     return str(cell or "").strip()
 
 
-def _is_parking_hal(full_partial):
-    return "parking" in str(full_partial or "").lower()
+_PARK_RE = re.compile(r"\b(parking|garage|lot|prkg|pkg)\b", re.I)
+
+
+def _looks_parking(*vals):
+    return any(_PARK_RE.search(str(v or "")) for v in vals)
+
+
+def _is_parking_hal(full_partial, section="", row=""):
+    # Type/Plan says parking, or the section/row names a lot/garage.
+    return "parking" in str(full_partial or "").lower() or _looks_parking(section, row)
+
+
+def _is_parking_pv(sec, row, venue=""):
+    # Sec/row names a lot, or the TicketVault Venue is a parking venue.
+    return _looks_parking(sec, row, venue)
 
 
 # Plan/Type values that mean the seats aren't actually held this season and so
@@ -437,10 +450,6 @@ NONACTIVE_KEYWORDS = ("deposit", "wait list", "waitlist", "waitlisted", "inquir"
 def _is_nonactive(full_partial):
     s = str(full_partial or "").lower()
     return any(k in s for k in NONACTIVE_KEYWORDS)
-
-
-def _is_parking_pv(sec, row):
-    return ("LOT" in sec) or ("PARKING" in row) or ("PARKING" in sec)
 
 
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
@@ -535,7 +544,7 @@ def parse_hal(rows, filename, company, year="", league=""):
             "total": _amount(_cell(row, ci["total"])) or 0.0,
             "sec_n": _sec(_cell(row, ci["section"])),
             "row_n": _row(_cell(row, ci["row"])),
-            "is_parking": _is_parking_hal(fp),
+            "is_parking": _is_parking_hal(fp, _cell(row, ci["section"]), _cell(row, ci["row"])),
         })
     return out, excluded
 
@@ -558,6 +567,7 @@ def parse_details(rows, filename, league=""):
         "cost": _col_index(header, "Total Cost"),
         "company": _col_index(header, "Company"),
         "vendor": _col_index(header, "Vendor"),
+        "venue": _col_index(header, "Venue"),
     }
     if ci["email"] is None or ci["team"] is None or ci["cost"] is None:
         raise ValueError(f"{os.path.basename(filename)}: Purchase Details file is "
@@ -576,7 +586,7 @@ def parse_details(rows, filename, league=""):
             "seatset": _seatnums(_cell(row, ci["seats"])),
             "event": str(_cell(row, ci["event"]) or ""),
             "cost": _amount(_cell(row, ci["cost"])) or 0.0,
-            "is_parking": _is_parking_pv(sec, rw),
+            "is_parking": _is_parking_pv(sec, rw, _cell(row, ci["venue"])),
             "company_norm": str(_cell(row, ci["company"]) or "").strip().lower(),
             "excluded_vendor": excluded_vendor,   # kept for source, skipped for matching
             "raw": list(row),
@@ -628,6 +638,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
             "# Games": r["games"], "HAL Total Cost": round(r["total"], 2),
             "TV Total Cost": tv_cost, "# Games w/Cost": wc, "# Games w/o Cost": woc,
+            "_parking": r["is_parking"],
         }
 
         def variances(tvc, games_wc, alt_email=""):
@@ -794,8 +805,11 @@ def _build_source_tab(ws, header, blocks):
 
 def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
                    hal_total, tolerance, hal_blocks, pv_header, pv_rows):
-    rec_n = len(reconciled)
-    nr_n = len(not_reconciled)
+    t_rec = [r for r in reconciled if not r.get("_parking")]
+    p_rec = [r for r in reconciled if r.get("_parking")]
+    t_nr = [r for r in not_reconciled if not r.get("_parking")]
+    p_nr = [r for r in not_reconciled if r.get("_parking")]
+    rec_n, nr_n = len(reconciled), len(not_reconciled)
     nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not bought in")
     de = sum(1 for r in not_reconciled if r["Notes"] == "different email address")
     mismatch = nr_n - nbi - de
@@ -837,22 +851,28 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
     bar(8, "RESULT"); hd(9, "Metric", "Count")
-    line(10, "Reconciled", rec_n)
-    line(11, "Not Reconciled", nr_n)
-    line(12, "Total # HAL Records", hal_total, bold=True)
-    bar(14, "NOT RECONCILED — BY REASON"); hd(15, "Reason", "Count")
-    line(16, "Not bought in", nbi)
-    line(17, "Different email address", de)
-    line(18, "Cost / games mismatch", mismatch)
-    line(19, "TOTAL", nr_n, bold=True)
+    line(10, "Reconciled", len(t_rec))
+    line(11, "Not Reconciled", len(t_nr))
+    line(12, "Parking Reconciled", len(p_rec))
+    line(13, "Parking Not Reconciled", len(p_nr))
+    line(14, "Total # HAL Records", hal_total, bold=True)
+    bar(16, "NOT RECONCILED — BY REASON"); hd(17, "Reason", "Count")
+    line(18, "Not bought in", nbi)
+    line(19, "Different email address", de)
+    line(20, "Cost / games mismatch", mismatch)
+    line(21, "TOTAL", nr_n, bold=True)
 
-    # ---- Reconciled ----------------------------------------------------- #
+    # ---- Tickets: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
-                      reconciled, RECON_BANDS, RECON_COST)
-
-    # ---- Not Reconciled ------------------------------------------------- #
+                      t_rec, RECON_BANDS, RECON_COST)
     _build_detail_tab(wb.create_sheet("Not Reconciled"), NR_COLS, NR_SRC, NR_W,
-                      not_reconciled, NR_BANDS, NR_COST, NR_PCT)
+                      t_nr, NR_BANDS, NR_COST, NR_PCT)
+
+    # ---- Parking: Reconciled / Not Reconciled --------------------------- #
+    _build_detail_tab(wb.create_sheet("Parking Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
+                      p_rec, RECON_BANDS, RECON_COST)
+    _build_detail_tab(wb.create_sheet("Parking Not Reconciled"), NR_COLS, NR_SRC, NR_W,
+                      p_nr, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Source data ---------------------------------------------------- #
     _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks)
@@ -862,6 +882,8 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     wb.save(bio)
     bio.seek(0)
     return bio.read(), {"reconciled": rec_n, "not_reconciled": nr_n,
+                        "tickets_reconciled": len(t_rec), "tickets_not_reconciled": len(t_nr),
+                        "parking_reconciled": len(p_rec), "parking_not_reconciled": len(p_nr),
                         "not_bought_in": nbi, "different_email": de,
                         "mismatch": mismatch, "clean": nr_n == 0}
 
