@@ -81,6 +81,14 @@ def load_company_names():
 
 COMPANY_NAMES = load_company_names()
 
+# Preferred display order for the company dropdown (mapping-list membership still
+# decides which companies exist; this only orders them).
+PREFERRED_COMPANY_ORDER = ["Y&S", "Grossman", "Sternbuch", "Pollak", "Levine",
+                           "Levovitz", "Chase", "Asher", "Katz", "GK", "TL",
+                           "Waxler", "TTG", "YourTix"]
+COMPANY_NAMES = ([c for c in PREFERRED_COMPANY_ORDER if c in COMPANY_NAMES]
+                 + [c for c in COMPANY_NAMES if c not in PREFERRED_COMPANY_ORDER])
+
 # Secondary-market vendors to exclude from Purchase Details before reconciling.
 EXCLUDED_VENDORS = ("ticketmaster", "tickpick", "stubhub", "ticket evolution", "gotickets")
 
