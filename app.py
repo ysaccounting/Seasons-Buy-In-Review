@@ -347,6 +347,15 @@ def _company_from_filename(filename):
     return stem.strip() or "Unknown"
 
 
+def _fmt_asof(as_of):
+    """Format the date picker's YYYY-MM-DD as m-d-yy (e.g. 2026-07-07 -> 7-7-26)."""
+    try:
+        d = dt.datetime.strptime(str(as_of).strip(), "%Y-%m-%d")
+        return f"{d.month}-{d.day}-{d.strftime('%y')}"
+    except ValueError:
+        return str(as_of).strip()
+
+
 # --------------------------------------------------------------------------- #
 # Seat / key normalization
 # --------------------------------------------------------------------------- #
@@ -601,8 +610,11 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         }
 
         def variances(tvc, games_wc, alt_email=""):
+            dollar = round(tvc - r["total"], 2)
+            pct = round(dollar / r["total"], 4) if r["total"] else None
             return {
-                "Var Total Cost": round(tvc - r["total"], 2),
+                "Var Total Cost": dollar,
+                "Var Total Cost %": pct,
                 "Var # Games w/Cost": (games_wc - r["games"]) if r["games"] is not None else None,
                 "Var Email Address": alt_email,
             }
@@ -676,38 +688,42 @@ RECON_COST = {9, 10}
 
 NR_COLS = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
-           "Total Cost", "# Games w/Cost", "Email Address"]
+           "Total Cost", "Total Cost", "# Games w/Cost", "Email Address"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
           "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
-          "Var Total Cost", "Var # Games w/Cost", "Var Email Address"]
+          "Var Total Cost", "Var Total Cost %", "Var # Games w/Cost", "Var Email Address"]
 NR_W = [26.0, 20.0, 28.6, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 20.1, 22.0,
-        13.0, 15.0, 30.0]
+        13.0, 13.0, 15.0, 30.0]
 NR_BANDS = [("per HAL", HAL_FILL, 1, 10), ("per TicketVault", TV_FILL, 11, 13),
-            ("Variances", VAR_FILL, 14, 16)]
+            ("Variances", VAR_FILL, 14, 17)]
 NR_COST = {10, 11, 14}
+NR_PCT = {15}
 
 
-def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols):
+def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols, pct_cols=frozenset()):
     ws.sheet_view.showGridLines = False
     for j, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(j)].width = w
     n = len(headers)
     for label, fill, first, last in bands:
         ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
-        dark = fill is not VAR_FILL
         c = ws.cell(1, first, label)
-        c.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF" if dark else "000000")
+        c.font = Font(name=ARIAL, size=9, bold=True, color="000000")
         c.alignment = CENTER
         for cc in range(first, last + 1):
             ws.cell(1, cc).fill = fill
     for j, h in enumerate(headers, 1):
-        cell = ws.cell(2, j, h); cell.font = Font(name=ARIAL, size=10, bold=True); cell.alignment = CENTER
+        cell = ws.cell(2, j, h)
+        cell.font = Font(name=ARIAL, size=10, bold=True, color="000000")
+        cell.alignment = CENTER
     for i, r in enumerate(rows, 3):
         for j, src in enumerate(srcs, 1):
             cell = ws.cell(i, j, r.get(src))
             cell.font = Font(name=ARIAL, size=9); cell.alignment = CENTER
             if j in cost_cols:
                 cell.number_format = CUR
+            elif j in pct_cols:
+                cell.number_format = "0.00%"
     end = 2 + len(rows)
     lefts = {b[2] for b in bands}
     rights = {b[3] for b in bands}
@@ -815,7 +831,7 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
 
     # ---- Not Reconciled ------------------------------------------------- #
     _build_detail_tab(wb.create_sheet("Not Reconciled"), NR_COLS, NR_SRC, NR_W,
-                      not_reconciled, NR_BANDS, NR_COST)
+                      not_reconciled, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Source data ---------------------------------------------------- #
     _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks)
@@ -858,6 +874,7 @@ def process():
         return jsonify({"error": "Please choose a Year."}), 400
     if not as_of:
         return jsonify({"error": "Please choose an As Of Date."}), 400
+    as_of_fmt = _fmt_asof(as_of)
     if not hal_files:
         return jsonify({"error": "Please upload at least one HAL season ticket database."}), 400
     if not details_files:
@@ -938,11 +955,11 @@ def process():
                                    " — company not in the Master Mapping List")
                                 + " — all its records will show as “Not bought in”.")
             reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
-            data, m = build_workbook(company, league, year, as_of, reconciled, not_reconciled,
+            data, m = build_workbook(company, league, year, as_of_fmt, reconciled, not_reconciled,
                                      len(recs), tolerance, hal_src_by_company.get(company, []),
                                      pv_header, vb["raw"])
             fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
-                     f"{_safe_name(year)} - As Of {_safe_name(as_of)}.xlsx")
+                     f"{_safe_name(year)} - As Of {_safe_name(as_of_fmt)}.xlsx")
             with open(os.path.join(folder, fname), "wb") as fh:
                 fh.write(data)
             tot_rec += m["reconciled"]
@@ -958,7 +975,7 @@ def process():
 
         if len(reports) > 1:
             zip_name = (f"Seasons Review - {_safe_name(league)} - {_safe_name(year)} - "
-                        f"As Of {_safe_name(as_of)}.zip")
+                        f"As Of {_safe_name(as_of_fmt)}.zip")
             with zipfile.ZipFile(os.path.join(folder, zip_name), "w",
                                  zipfile.ZIP_DEFLATED) as zf:
                 for rep in reports:
@@ -975,7 +992,7 @@ def process():
 
     total_records = sum(len(v) for v in hal_by_company.values())
     return jsonify({
-        "league": league, "year": year, "as_of": as_of,
+        "league": league, "year": year, "as_of": as_of_fmt,
         "companies": len(reports),
         "total_records": total_records, "reconciled": tot_rec, "not_reconciled": tot_nr,
         "clean": tot_nr == 0,
