@@ -221,11 +221,24 @@ TEAM_INDEX = {
 
 
 def _normalize_team(name, league):
-    lc = re.sub(r"\s+", " ", str(name or "").strip()).lower()
-    if not lc:
+    raw = re.sub(r"\s+", " ", str(name or "").strip())
+    if not raw:
         return ""
     idx = TEAM_INDEX.get(league, {})
-    return idx.get(lc, str(name).strip())
+    # try the name as-is, then progressively strip trailing qualifiers like
+    # " - New", " (New)", " - Renewal" — accepting a stripped form only if it
+    # resolves to a real team, so we never mangle a genuine name.
+    candidates, s = [raw.lower()], raw
+    for _ in range(3):
+        m = re.sub(r"\s*(?:-\s*[^-()]+|\([^()]*\))\s*$", "", s).strip()
+        if m == s or not m:
+            break
+        candidates.append(m.lower())
+        s = m
+    for cand in candidates:
+        if cand in idx:
+            return idx[cand]
+    return raw
 
 DEFAULT_TOLERANCE = 1.00  # dollars; TV total must tie to HAL total within this
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
@@ -702,8 +715,8 @@ NR_PCT = {15}
 
 def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols, pct_cols=frozenset()):
     ws.sheet_view.showGridLines = False
-    for j, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(j)].width = w
+    for j, (w, h) in enumerate(zip(widths, headers), 1):
+        ws.column_dimensions[get_column_letter(j)].width = max(w, len(str(h)) + 4)
     n = len(headers)
     for label, fill, first, last in bands:
         ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
