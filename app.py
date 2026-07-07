@@ -625,7 +625,13 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         if not vr:
             own_matches = []
         elif r["is_parking"]:
-            own_matches = [x for x in vr if x["is_parking"]]
+            # try an exact lot/seat match first so multiple spots don't get
+            # summed against each single HAL row; fall back to all of the team's
+            # parking when the lot/seat numbers don't line up.
+            hs = _seatnums(r["Seats"])
+            seat_m = [x for x in vr if x["is_parking"] and x["sec"] == r["sec_n"]
+                      and x["row"] == r["row_n"] and hs and (x["seatset"] & hs)]
+            own_matches = seat_m if seat_m else [x for x in vr if x["is_parking"]]
         else:
             hs = _seatnums(r["Seats"])
             own_matches = [x for x in vr if (not x["is_parking"])
@@ -633,6 +639,9 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                            and (x["seatset"] & hs)]
 
         wc, woc, tv_cost = _games_split(own_matches)
+        # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
+        # Compare HAL # games against TV games WITHOUT cost instead of with cost.
+        zero_parking = r["is_parking"] and r["total"] == 0
         base = {
             "Team": r["team"], "Email": r["Email"], "Full/Partial": r["Full/Partial"],
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
@@ -641,20 +650,24 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             "_parking": r["is_parking"],
         }
 
-        def variances(tvc, games_wc, alt_email=""):
+        def variances(tvc, games_wc, games_woc, alt_email=""):
             dollar = round(tvc - r["total"], 2)
             pct = round(dollar / r["total"], 4) if r["total"] else None
+            ref = games_woc if zero_parking else games_wc
             return {
                 "Var Total Cost": dollar,
                 "Var Total Cost %": pct,
-                "Var # Games w/Cost": (games_wc - r["games"]) if r["games"] is not None else None,
+                "Var # Games w/Cost": (ref - r["games"]) if r["games"] is not None else None,
                 "Var Email Address": alt_email,
             }
 
         if own_matches:
             cost_ok = abs(tv_cost - r["total"]) <= tolerance
             games_known = r["games"] is not None
-            games_ok = games_known and wc == r["games"]
+            if zero_parking:
+                games_ok = (not games_known) or (woc >= r["games"])
+            else:
+                games_ok = games_known and wc == r["games"]
             if cost_ok and games_ok:
                 reconciled.append(base)
                 continue
@@ -662,8 +675,9 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             if not cost_ok:
                 parts.append("total cost not equal")
             if not games_ok:
-                parts.append("# games not equal" if games_known else "# games not in HAL")
-            not_reconciled.append({**base, **variances(tv_cost, wc),
+                parts.append("# games not in HAL"
+                             if (not games_known and not zero_parking) else "# games not equal")
+            not_reconciled.append({**base, **variances(tv_cost, wc, woc),
                                     "Notes": ", ".join(parts), "_p": 1})
             continue
 
@@ -683,13 +697,13 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 if cost_ok and games_ok:
                     alt = {**base, "TV Total Cost": a_cost,
                            "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
-                    not_reconciled.append({**alt, **variances(a_cost, a_wc, alt_email),
+                    not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
                                            "Notes": "different email address", "_p": 2})
                     break
             else:
-                not_reconciled.append({**base, **variances(0.0, 0), "Notes": "Not bought in", "_p": 0})
+                not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not bought in", "_p": 0})
         else:
-            not_reconciled.append({**base, **variances(0.0, 0), "Notes": "Not bought in", "_p": 0})
+            not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not bought in", "_p": 0})
 
     reconciled.sort(key=lambda x: (x["Team"], x["Email"]))
     not_reconciled.sort(key=lambda x: (x["_p"], -x["HAL Total Cost"]))
