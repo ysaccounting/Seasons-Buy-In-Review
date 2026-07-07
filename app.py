@@ -512,9 +512,10 @@ def parse_hal(rows, filename, company, year="", league=""):
 
 def parse_details(rows, filename, league=""):
     """Parse a TicketVault Purchase Details export. Returns
-    (parsed_rows, header, kept, excluded_vendor) where each parsed row carries
-    its normalized team, seat data, company (for scoping), and the original row
-    (for the source tab). Secondary-market vendors are dropped."""
+    (parsed_rows, header, usable) where each parsed row carries its normalized
+    team, seat data, company (for scoping), original row (for the source tab),
+    and an `excluded_vendor` flag. Secondary-market vendor rows are kept for the
+    source tab but flagged so they're skipped during matching."""
     hidx, header = _find_header_row(rows)
     raw_header = list(rows[hidx]) if hidx < len(rows) else []
     ci = {
@@ -531,15 +532,13 @@ def parse_details(rows, filename, league=""):
     if ci["email"] is None or ci["team"] is None or ci["cost"] is None:
         raise ValueError(f"{os.path.basename(filename)}: Purchase Details file is "
                          f"missing 'PO Email Account', 'Team/Performer' or 'Total Cost'.")
-    parsed, excluded_vendor = [], 0
+    parsed, usable = [], 0
     for row in rows[hidx + 1:]:
         email = str(_cell(row, ci["email"]) or "").strip().lower()
         team = _normalize_team(_cell(row, ci["team"]), league)
         if not email or not team:
             continue
-        if _is_excluded_vendor(_cell(row, ci["vendor"])):
-            excluded_vendor += 1
-            continue
+        excluded_vendor = _is_excluded_vendor(_cell(row, ci["vendor"]))
         sec = _sec(_cell(row, ci["sec"]))
         rw = _row(_cell(row, ci["row"]))
         parsed.append({
@@ -549,9 +548,12 @@ def parse_details(rows, filename, league=""):
             "cost": _amount(_cell(row, ci["cost"])) or 0.0,
             "is_parking": _is_parking_pv(sec, rw),
             "company_norm": str(_cell(row, ci["company"]) or "").strip().lower(),
+            "excluded_vendor": excluded_vendor,   # kept for source, skipped for matching
             "raw": list(row),
         })
-    return parsed, raw_header, len(parsed), excluded_vendor
+        if not excluded_vendor:
+            usable += 1
+    return parsed, raw_header, usable
 
 
 # --------------------------------------------------------------------------- #
@@ -892,24 +894,20 @@ def process():
             warnings.append(f"Excluded {excluded_total} non-active row(s) "
                             f"(deposits, waitlist, inquiries, cancellations) from the review.")
 
-        # ---- Purchase Details: parse, exclude vendors, scope by company ---- #
-        pv_parsed, pv_header, detail_rows, vendor_excluded = [], [], 0, 0
+        # ---- Purchase Details: parse, scope by company -------------------- #
+        pv_parsed, pv_header, detail_rows = [], [], 0
         for f in details_files:
-            parsed, hdr, kept, vex = parse_details(_rows_from_upload(f.filename, f.read()),
-                                                   f.filename, league)
+            parsed, hdr, usable = parse_details(_rows_from_upload(f.filename, f.read()),
+                                                f.filename, league)
             pv_parsed.extend(parsed)
             if hdr:
                 pv_header = hdr
-            detail_rows += kept
-            vendor_excluded += vex
+            detail_rows += usable
         if detail_rows == 0:
             return jsonify({"error": "No usable rows found in the Purchase Details file(s)."}), 400
-        if vendor_excluded:
-            warnings.append(f"Excluded {vendor_excluded} Purchase-Details row(s) from "
-                            f"secondary-market vendors (Ticketmaster, TickPick, StubHub, "
-                            f"Ticket Evolution, GoTickets).")
 
-        # build a company-scoped vault per broker (Master Mapping List)
+        # build a company-scoped vault per broker (Master Mapping List). Vendor
+        # rows are kept in the source dump but skipped when matching.
         vault = {}   # broker -> {primary, secondary, raw}
         for x in pv_parsed:
             broker = PVCOMPANY_TO_BROKER.get(x["company_norm"])
@@ -917,10 +915,12 @@ def process():
                 continue
             vb = vault.setdefault(broker, {"primary": defaultdict(list),
                                            "secondary": defaultdict(list), "raw": []})
+            vb["raw"].append(x["raw"])
+            if x["excluded_vendor"]:
+                continue
             vb["primary"][(x["email"], x["team"])].append(x)
             if not x["is_parking"]:
                 vb["secondary"][(x["team"], x["sec"], x["row"])].append(x)
-            vb["raw"].append(x["raw"])
 
         token = uuid.uuid4().hex
         folder = os.path.join(STORE_DIR, token)
