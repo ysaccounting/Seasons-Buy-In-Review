@@ -102,7 +102,7 @@
 <div class="card">
   <div class="card-body">
     <div class="card-title">Season Ticket Buy-In Review</div>
-    <div class="card-sub">Reconcile HAL season-ticket databases against the purchase details loaded into TicketVault. Tag each HAL file with its <strong>Company</strong>; each company gets its own report named <em>Seasons Review - Company - League - Year</em>.</div>
+    <div class="card-sub">Reconcile HAL against TicketVault purchase details to identify discrepancies with season ticket buy-ins for any league, year, and broker.</em>.</div>
 
     <div class="controls">
       <div class="control">
@@ -119,7 +119,7 @@
       </div>
     </div>
 
-    <div class="section-label">Season Ticket Database — upload the HAL export(s) and pick a Company per file.</div>
+    <div class="section-label">Upload HAL for one or more brokers and select from the drop-down list which broker each one is for.</div>
     <div class="dropzone" id="dzHal" data-key="hal">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
@@ -127,7 +127,7 @@
     </div>
     <div class="file-list" id="listHal"></div>
 
-    <div class="section-label spaced">Purchase Details — upload the TicketVault Purchase Details export(s).</div>
+    <div class="section-label spaced">Upload TicketVault purchase details for one or more brokers, using the desired event date range and category filter.</div>
     <div class="dropzone" id="dzDetails" data-key="details">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
