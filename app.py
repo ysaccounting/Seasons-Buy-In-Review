@@ -452,7 +452,8 @@ def _is_nonactive(full_partial):
 # non-active filter. Keyed by company Short Name (lowercased). For Sternbuch,
 # "PSL" rows are extras alongside the real annual season-ticket rows.
 COMPANY_EXCLUDE_TYPES = {
-    "sternbuch": {"psl"},
+    "sternbuch": {"psl", "ssl"},
+    "ttg": {"psl"},
 }
 
 # Per-company override for which column holds total cost, when a HAL has several
