@@ -248,6 +248,7 @@ YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 # whose layout differs, add its header names to the relevant list here.
 HAL_SYNONYMS = {
     "company": ["Company", "Client", "Broker", "Group"],
+    "status":  ["Account Status", "Status", "Acct Status", "Account State"],
     "email":   ["Email", "Account Email", "Email Address", "Login Email",
                 "Email (from Profiles)", "Account EMAIL", "user Name/email",
                 "Username/Email", "User Name/Email", "PO Email Account"],
@@ -396,14 +397,18 @@ def _seatnums(cell):
         lo, hi = sorted((cell.month, cell.day))
         return set(range(lo, hi + 1))
     s = str(cell or "").replace(" ", "")
-    m = re.match(r"^(\d+)-(\d+)$", s)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-        if a <= b and b - a < 60:
-            return set(range(a, b + 1))
-    if re.match(r"^\d+$", s):
-        return {int(s)}
-    return set()
+    if not s:
+        return set()
+    result = set()
+    for part in re.split(r"[,/&;]+", s):   # compound seats, e.g. "5-6/5-6"
+        m = re.match(r"^(\d+)-(\d+)$", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a <= b and b - a < 60:
+                result |= set(range(a, b + 1))
+        elif re.match(r"^\d+$", part):
+            result.add(int(part))
+    return result
 
 
 def _seat_text(cell):
@@ -433,14 +438,29 @@ def _is_parking_pv(sec, row, venue=""):
 
 # Plan/Type values that mean the seats aren't actually held this season and so
 # shouldn't be reconciled. (You may also strip these before uploading.)
-NONACTIVE_KEYWORDS = ("deposit", "wait list", "waitlist", "waitlisted", "inquir",
-                      "notification", "cancel", "nothing for this", "back and forth",
-                      "pending", "declined", "not renew")
+NONACTIVE_KEYWORDS = ("deposit", "wait list", "waiting", "waitlist", "waitlisted",
+                      "inquir", "notification", "cancel", "nothing for this",
+                      "back and forth", "pending", "declined", "not renew")
 
 
 def _is_nonactive(full_partial):
     s = str(full_partial or "").lower()
     return any(k in s for k in NONACTIVE_KEYWORDS)
+
+
+# Per-company Full/Partial (plan/type) values to exclude, on top of the global
+# non-active filter. Keyed by company Short Name (lowercased). For Sternbuch,
+# "PSL" rows are extras alongside the real annual season-ticket rows.
+COMPANY_EXCLUDE_TYPES = {
+    "sternbuch": {"psl"},
+}
+
+# Per-company override for which column holds total cost, when a HAL has several
+# amount-like columns and the generic search would pick the wrong one. TTG has
+# empty "Amount ($)" columns before its real "Total Price".
+COMPANY_TOTAL_COLS = {
+    "ttg": ["Total Price"],
+}
 
 
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
@@ -508,34 +528,53 @@ def parse_hal(rows, filename, company, year="", league=""):
             f"HAL_SYNONYMS.")
     if ci["total"] is None:
         ci["total"] = _col_index(header, *_year_total_cols(year))
+    total_override = COMPANY_TOTAL_COLS.get(str(company).strip().lower())
+    if total_override:
+        idx = _col_index(header, *total_override)
+        if idx is not None:
+            ci["total"] = idx
     if ci["fp"] is None:
         ci["fp"] = _col_index(header, *_year_plan_cols(year))
     out, excluded = [], 0
+    exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
     for row in data_rows:
         team = _normalize_team(_cell(row, ci["team"]), league)
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
             continue
         fp = str(_cell(row, ci["fp"]) or "").strip()
-        if _is_nonactive(fp):
+        status = str(_cell(row, ci["status"]) or "").strip()
+        if _is_nonactive(fp) or _is_nonactive(status):
+            excluded += 1
+            continue
+        if fp.lower() in exclude_types:
             excluded += 1
             continue
         games = _amount(_cell(row, ci["games"]))
+        section = str(_cell(row, ci["section"]) or "").strip()
+        row_v = str(_cell(row, ci["row"]) or "").strip()
+        seats = _seat_text(_cell(row, ci["seats"]))
+        is_parking = _is_parking_hal(fp, _cell(row, ci["section"]), _cell(row, ci["row"]))
+        # no seat location at all (blank section, row and seats) — typically a
+        # deposit/waitlist placeholder; omit from the reconciliation.
+        if not section and not row_v and not seats and not is_parking:
+            excluded += 1
+            continue
         out.append({
             "company": company,
             "emails": emails,
             "team": team,
             "Full/Partial": fp,
-            "Section": str(_cell(row, ci["section"]) or "").strip(),
-            "Row": str(_cell(row, ci["row"]) or "").strip(),
-            "Seats": _seat_text(_cell(row, ci["seats"])),
+            "Section": section,
+            "Row": row_v,
+            "Seats": seats,
             "Qty": str(_cell(row, ci["qty"]) or "").strip(),
             "Email": str(_cell(row, ci["email"]) or "").strip(),
             "games": int(games) if games is not None else None,
             "total": _amount(_cell(row, ci["total"])) or 0.0,
             "sec_n": _sec(_cell(row, ci["section"])),
             "row_n": _row(_cell(row, ci["row"])),
-            "is_parking": _is_parking_hal(fp, _cell(row, ci["section"]), _cell(row, ci["row"])),
+            "is_parking": is_parking,
         })
     return out, excluded
 
@@ -619,9 +658,16 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             own_matches = seat_m if seat_m else [x for x in vr if x["is_parking"]]
         else:
             hs = _seatnums(r["Seats"])
-            own_matches = [x for x in vr if (not x["is_parking"])
-                           and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
-                           and (x["seatset"] & hs)]
+            if hs:
+                own_matches = [x for x in vr if (not x["is_parking"])
+                               and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
+                               and (x["seatset"] & hs)]
+            elif r["sec_n"] and r["row_n"]:
+                # seats missing on HAL — reconcile on section + row if the rest ties
+                own_matches = [x for x in vr if (not x["is_parking"])
+                               and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]]
+            else:
+                own_matches = []
 
         wc, woc, tv_cost = _games_split(own_matches)
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
@@ -666,13 +712,14 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             continue
 
         # nothing under the account's own email — look for the same seats under a
-        # DIFFERENT email in this broker's vault (same team/sec/row, seat overlap)
-        if not r["is_parking"]:
+        # DIFFERENT email in this broker's vault (same team/sec/row). When HAL has
+        # no seats, match on section + row alone.
+        if not r["is_parking"] and r["sec_n"] and r["row_n"]:
             hs = _seatnums(r["Seats"])
             cands = secondary_index.get((r["team"], r["sec_n"], r["row_n"]), [])
             by_email = defaultdict(list)
             for x in cands:
-                if x["email"] not in own and (x["seatset"] & hs):
+                if x["email"] not in own and ((not hs) or (x["seatset"] & hs)):
                     by_email[x["email"]].append(x)
             for alt_email, ms in by_email.items():
                 a_wc, a_woc, a_cost = _games_split(ms)
@@ -689,8 +736,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         else:
             not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not bought in", "_p": 0})
 
-    reconciled.sort(key=lambda x: (x["Team"], x["Email"]))
-    not_reconciled.sort(key=lambda x: (x["_p"], -x["HAL Total Cost"]))
+    reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
+    not_reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
     return reconciled, not_reconciled
 
 
@@ -772,15 +819,20 @@ def _src_val(v):
     return str(v)
 
 
-def _build_source_tab(ws, header, blocks):
+def _build_source_tab(ws, header, blocks, clean_seats=False):
     """Dump raw source rows (header + data). `blocks` is a list of (header, rows)
-    so multiple files for one company stack. `header` is a fallback header."""
+    so multiple files for one company stack. `header` is a fallback header. When
+    clean_seats is set, the Seats column is shown the way the app parses it
+    (e.g. a date-corrupted '2026-06-08' becomes '6-8')."""
     ws.sheet_view.showGridLines = False
     max_cols = 1
     r = 1
     first = True
     for blk_header, blk_rows in blocks:
         hdr = blk_header or header
+        seat_i = None
+        if clean_seats:
+            seat_i = _col_index([_norm_header(c) for c in hdr], *HAL_SYNONYMS["seats"])
         for j, h in enumerate(hdr, 1):
             cell = ws.cell(r, j, _src_val(h))
             cell.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF")
@@ -790,6 +842,8 @@ def _build_source_tab(ws, header, blocks):
         r += 1
         for row in blk_rows:
             for j, v in enumerate(row, 1):
+                if seat_i is not None and (j - 1) == seat_i:
+                    v = _seat_text(v)
                 ws.cell(r, j, _src_val(v)).font = Font(name=ARIAL, size=9)
             r += 1
         if first:
@@ -873,7 +927,8 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
                       p_nr, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Source data ---------------------------------------------------- #
-    _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks)
+    _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks,
+                      clean_seats=True)
     _build_source_tab(wb.create_sheet("Purchase Details"), pv_header, [(pv_header, pv_rows)])
 
     bio = io.BytesIO()
@@ -983,13 +1038,6 @@ def process():
         tot_rec = tot_nr = 0
         for company, recs in hal_by_company.items():
             vb = vault.get(company, {"primary": {}, "secondary": {}, "raw": []})
-            if not vb["raw"]:
-                mapped = BROKER_PVCOMPANIES.get(company)
-                warnings.append(f"No Purchase Details found for {company}"
-                                + (f" (expected TicketVault company: "
-                                   f"{', '.join(sorted(mapped))})" if mapped else
-                                   " — company not in the Master Mapping List")
-                                + " — all its records will show as “Not bought in”.")
             reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
             data, m = build_workbook(company, league, year, as_of_fmt, reconciled, not_reconciled,
                                      len(recs), tolerance, hal_src_by_company.get(company, []),
