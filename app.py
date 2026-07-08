@@ -89,10 +89,6 @@ PREFERRED_COMPANY_ORDER = ["Y&S", "Grossman", "Sternbuch", "Pollak", "Levine",
 COMPANY_NAMES = ([c for c in PREFERRED_COMPANY_ORDER if c in COMPANY_NAMES]
                  + [c for c in COMPANY_NAMES if c not in PREFERRED_COMPANY_ORDER])
 
-# Secondary-market vendors to exclude from Purchase Details before reconciling.
-EXCLUDED_VENDORS = ("ticketmaster", "tickpick", "stubhub", "ticket evolution", "gotickets")
-
-
 def load_broker_pvcompanies():
     """From the Master Mapping List, map each broker Short Name to the set of
     TicketVault 'Company' values that belong to it (col 'TicketVault Company /
@@ -119,11 +115,6 @@ def load_broker_pvcompanies():
 
 
 BROKER_PVCOMPANIES, PVCOMPANY_TO_BROKER = load_broker_pvcompanies()
-
-
-def _is_excluded_vendor(vendor):
-    v = str(vendor or "").strip().lower()
-    return any(v.startswith(x) for x in EXCLUDED_VENDORS)
 
 # --------------------------------------------------------------------------- #
 # Team-name normalization
@@ -552,9 +543,8 @@ def parse_hal(rows, filename, company, year="", league=""):
 def parse_details(rows, filename, league=""):
     """Parse a TicketVault Purchase Details export. Returns
     (parsed_rows, header, usable) where each parsed row carries its normalized
-    team, seat data, company (for scoping), original row (for the source tab),
-    and an `excluded_vendor` flag. Secondary-market vendor rows are kept for the
-    source tab but flagged so they're skipped during matching."""
+    team, seat data, company (for scoping), and the original row (for the source
+    tab)."""
     hidx, header = _find_header_row(rows)
     raw_header = list(rows[hidx]) if hidx < len(rows) else []
     ci = {
@@ -566,19 +556,17 @@ def parse_details(rows, filename, league=""):
         "event": _col_index(header, "Event Date"),
         "cost": _col_index(header, "Total Cost"),
         "company": _col_index(header, "Company"),
-        "vendor": _col_index(header, "Vendor"),
         "venue": _col_index(header, "Venue"),
     }
     if ci["email"] is None or ci["team"] is None or ci["cost"] is None:
         raise ValueError(f"{os.path.basename(filename)}: Purchase Details file is "
                          f"missing 'PO Email Account', 'Team/Performer' or 'Total Cost'.")
-    parsed, usable = [], 0
+    parsed = []
     for row in rows[hidx + 1:]:
         email = str(_cell(row, ci["email"]) or "").strip().lower()
         team = _normalize_team(_cell(row, ci["team"]), league)
         if not email or not team:
             continue
-        excluded_vendor = _is_excluded_vendor(_cell(row, ci["vendor"]))
         sec = _sec(_cell(row, ci["sec"]))
         rw = _row(_cell(row, ci["row"]))
         parsed.append({
@@ -588,12 +576,9 @@ def parse_details(rows, filename, league=""):
             "cost": _amount(_cell(row, ci["cost"])) or 0.0,
             "is_parking": _is_parking_pv(sec, rw, _cell(row, ci["venue"])),
             "company_norm": str(_cell(row, ci["company"]) or "").strip().lower(),
-            "excluded_vendor": excluded_vendor,   # kept for source, skipped for matching
             "raw": list(row),
         })
-        if not excluded_vendor:
-            usable += 1
-    return parsed, raw_header, usable
+    return parsed, raw_header, len(parsed)
 
 
 # --------------------------------------------------------------------------- #
@@ -963,9 +948,6 @@ def process():
             excluded_total += excluded
         if not any(hal_by_company.values()):
             return jsonify({"error": "No season-ticket records found in the HAL file(s)."}), 400
-        if excluded_total:
-            warnings.append(f"Excluded {excluded_total} non-active row(s) "
-                            f"(deposits, waitlist, inquiries, cancellations) from the review.")
 
         # ---- Purchase Details: parse, scope by company -------------------- #
         pv_parsed, pv_header, detail_rows = [], [], 0
@@ -989,8 +971,6 @@ def process():
             vb = vault.setdefault(broker, {"primary": defaultdict(list),
                                            "secondary": defaultdict(list), "raw": []})
             vb["raw"].append(x["raw"])
-            if x["excluded_vendor"]:
-                continue
             vb["primary"][(x["email"], x["team"])].append(x)
             if not x["is_parking"]:
                 vb["secondary"][(x["team"], x["sec"], x["row"])].append(x)
