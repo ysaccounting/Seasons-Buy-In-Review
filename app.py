@@ -463,6 +463,12 @@ COMPANY_TOTAL_COLS = {
     "ttg": ["Total Price"],
 }
 
+# Per-company row exclusion by column value: (column name, {values to drop}).
+# TTG rows where the "Regular" column is "No" are excluded.
+COMPANY_EXCLUDE_WHERE = {
+    "ttg": [("Regular", {"no"})],
+}
+
 
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
 
@@ -538,6 +544,11 @@ def parse_hal(rows, filename, company, year="", league=""):
         ci["fp"] = _col_index(header, *_year_plan_cols(year))
     out, excluded = [], 0
     exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
+    where_checks = []
+    for colname, badvals in COMPANY_EXCLUDE_WHERE.get(str(company).strip().lower(), []):
+        widx = _col_index(header, colname)
+        if widx is not None:
+            where_checks.append((widx, {v.lower() for v in badvals}))
     for row in data_rows:
         team = _normalize_team(_cell(row, ci["team"]), league)
         emails = _emails(_cell(row, ci["email"]))
@@ -549,6 +560,10 @@ def parse_hal(rows, filename, company, year="", league=""):
             excluded += 1
             continue
         if fp.lower() in exclude_types:
+            excluded += 1
+            continue
+        if any(str(_cell(row, widx) or "").strip().lower() in badvals
+               for widx, badvals in where_checks):
             excluded += 1
             continue
         games = _amount(_cell(row, ci["games"]))
