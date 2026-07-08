@@ -239,7 +239,7 @@ def _normalize_team(name, league):
             return idx[cand]
     return raw
 
-DEFAULT_TOLERANCE = 1.00  # dollars; TV total must tie to HAL total within this
+DEFAULT_TOLERANCE = 5.00  # dollars; TV total must tie to HAL total within this
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 
@@ -436,6 +436,18 @@ def _is_parking_pv(sec, row, venue=""):
     return _looks_parking(sec, row, venue)
 
 
+# Flex / ticket-bank plans: pay a credit to the team and use it on any seats to
+# any game. There are no seats to match in TicketVault — reconcile on total spend.
+_FLEX_LOC = {"var", "various", "flex", "tbd", "vary", "tba"}
+
+
+def _is_flex_hal(full_partial, section, row, seats):
+    fp = str(full_partial or "").lower()
+    if "flex" in fp or "ticket bank" in fp:
+        return True
+    return any(str(v or "").strip().lower() in _FLEX_LOC for v in (section, row, seats))
+
+
 # Plan/Type values that mean the seats aren't actually held this season and so
 # shouldn't be reconciled. (You may also strip these before uploading.)
 NONACTIVE_KEYWORDS = ("deposit", "wait list", "waiting", "waitlist", "waitlisted",
@@ -570,10 +582,11 @@ def parse_hal(rows, filename, company, year="", league=""):
         section = str(_cell(row, ci["section"]) or "").strip()
         row_v = str(_cell(row, ci["row"]) or "").strip()
         seats = _seat_text(_cell(row, ci["seats"]))
-        is_parking = _is_parking_hal(fp, _cell(row, ci["section"]), _cell(row, ci["row"]))
+        is_flex = _is_flex_hal(fp, section, row_v, seats)
+        is_parking = (not is_flex) and _is_parking_hal(fp, section, row_v)
         # no seat location at all (blank section, row and seats) — typically a
-        # deposit/waitlist placeholder; omit from the reconciliation.
-        if not section and not row_v and not seats and not is_parking:
+        # deposit/waitlist placeholder; omit unless it's parking or flex.
+        if not section and not row_v and not seats and not is_parking and not is_flex:
             excluded += 1
             continue
         out.append({
@@ -591,6 +604,7 @@ def parse_hal(rows, filename, company, year="", league=""):
             "sec_n": _sec(_cell(row, ci["section"])),
             "row_n": _row(_cell(row, ci["row"])),
             "is_parking": is_parking,
+            "is_flex": is_flex,
         })
     return out, excluded
 
@@ -664,6 +678,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
 
         if not vr:
             own_matches = []
+        elif r["is_flex"]:
+            own_matches = list(vr)   # flex/ticket-bank: no seats — use all spend
         elif r["is_parking"]:
             # try an exact lot/seat match first so multiple spots don't get
             # summed against each single HAL row; fall back to all of the team's
@@ -694,19 +710,36 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
             "# Games": r["games"], "HAL Total Cost": round(r["total"], 2),
             "TV Total Cost": tv_cost, "# Games w/Cost": wc, "# Games w/o Cost": woc,
-            "_parking": r["is_parking"],
+            "_parking": r["is_parking"], "_flex": r["is_flex"],
         }
 
         def variances(tvc, games_wc, games_woc, alt_email=""):
             dollar = round(tvc - r["total"], 2)
             pct = round(dollar / r["total"], 4) if r["total"] else None
-            ref = games_woc if zero_parking else games_wc
+            if r["is_flex"] or r["games"] is None:
+                gvar = None
+            else:
+                ref = games_woc if zero_parking else games_wc
+                gvar = ref - r["games"]
             return {
                 "Var Total Cost": dollar,
                 "Var Total Cost %": pct,
-                "Var # Games w/Cost": (ref - r["games"]) if r["games"] is not None else None,
+                "Var # Games w/Cost": gvar,
                 "Var Email Address": alt_email,
             }
+
+        # flex / ticket-bank: no seats to match — reconcile when the TicketVault
+        # spend for this email+team is at least the HAL credit.
+        if r["is_flex"]:
+            if own_matches and (tv_cost + tolerance >= r["total"]):
+                reconciled.append(base)
+            elif own_matches:
+                not_reconciled.append({**base, **variances(tv_cost, wc, woc),
+                                        "Notes": "total cost not equal", "_p": 1})
+            else:
+                not_reconciled.append({**base, **variances(0.0, 0, 0),
+                                        "Notes": "Not bought in", "_p": 0})
+            continue
 
         if own_matches:
             cost_ok = abs(tv_cost - r["total"]) <= tolerance
@@ -873,10 +906,12 @@ def _build_source_tab(ws, header, blocks, clean_seats=False):
 
 def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
                    hal_total, tolerance, hal_blocks, pv_header, pv_rows):
-    t_rec = [r for r in reconciled if not r.get("_parking")]
+    t_rec = [r for r in reconciled if not r.get("_parking") and not r.get("_flex")]
     p_rec = [r for r in reconciled if r.get("_parking")]
-    t_nr = [r for r in not_reconciled if not r.get("_parking")]
+    f_rec = [r for r in reconciled if r.get("_flex")]
+    t_nr = [r for r in not_reconciled if not r.get("_parking") and not r.get("_flex")]
     p_nr = [r for r in not_reconciled if r.get("_parking")]
+    f_nr = [r for r in not_reconciled if r.get("_flex")]
     rec_n, nr_n = len(reconciled), len(not_reconciled)
     nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not bought in")
     de = sum(1 for r in not_reconciled if r["Notes"] == "different email address")
@@ -923,12 +958,14 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     line(11, "Not Reconciled", len(t_nr))
     line(12, "Parking Reconciled", len(p_rec))
     line(13, "Parking Not Reconciled", len(p_nr))
-    line(14, "Total # HAL Records", hal_total, bold=True)
-    bar(16, "NOT RECONCILED — BY REASON"); hd(17, "Reason", "Count")
-    line(18, "Not bought in", nbi)
-    line(19, "Different email address", de)
-    line(20, "Cost / games mismatch", mismatch)
-    line(21, "TOTAL", nr_n, bold=True)
+    line(14, "Flex Reconciled", len(f_rec))
+    line(15, "Flex Not Reconciled", len(f_nr))
+    line(16, "Total # HAL Records", hal_total, bold=True)
+    bar(18, "NOT RECONCILED — BY REASON"); hd(19, "Reason", "Count")
+    line(20, "Not bought in", nbi)
+    line(21, "Different email address", de)
+    line(22, "Cost / games mismatch", mismatch)
+    line(23, "TOTAL", nr_n, bold=True)
 
     # ---- Tickets: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
@@ -942,6 +979,12 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     _build_detail_tab(wb.create_sheet("Parking Not Reconciled"), NR_COLS, NR_SRC, NR_W,
                       p_nr, NR_BANDS, NR_COST, NR_PCT)
 
+    # ---- Flex / ticket-bank: Reconciled / Not Reconciled ---------------- #
+    _build_detail_tab(wb.create_sheet("Flex Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
+                      f_rec, RECON_BANDS, RECON_COST)
+    _build_detail_tab(wb.create_sheet("Flex Not Reconciled"), NR_COLS, NR_SRC, NR_W,
+                      f_nr, NR_BANDS, NR_COST, NR_PCT)
+
     # ---- Source data ---------------------------------------------------- #
     _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks,
                       clean_seats=True)
@@ -953,6 +996,7 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     return bio.read(), {"reconciled": rec_n, "not_reconciled": nr_n,
                         "tickets_reconciled": len(t_rec), "tickets_not_reconciled": len(t_nr),
                         "parking_reconciled": len(p_rec), "parking_not_reconciled": len(p_nr),
+                        "flex_reconciled": len(f_rec), "flex_not_reconciled": len(f_nr),
                         "not_bought_in": nbi, "different_email": de,
                         "mismatch": mismatch, "clean": nr_n == 0}
 
