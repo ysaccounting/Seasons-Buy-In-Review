@@ -500,6 +500,10 @@ COMPANY_EXCLUDE_WHERE = {
 # (Now generalized: any HAL row with a blank # games reconciles on cost.)
 
 
+# Companies for which a blank status also means exclude from reconciliation.
+COMPANY_EXCLUDE_BLANK_STATUS = {"y&s"}
+
+
 def _league_matches(hal_league, selected):
     a = re.sub(r"[^a-z]", "", str(hal_league or "").lower())
     b = re.sub(r"[^a-z]", "", str(selected or "").lower())
@@ -622,6 +626,7 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
         ci["status"] = next((i for i, h in enumerate(header) if "status" in h), None)
     out, excluded, annotations = [], 0, []
     exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
+    exclude_blank_status = str(company).strip().lower() in COMPANY_EXCLUDE_BLANK_STATUS
     where_checks = []
     for colname, badvals in COMPANY_EXCLUDE_WHERE.get(str(company).strip().lower(), []):
         widx = _col_index(header, colname)
@@ -650,6 +655,10 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
             annotations.append((False, "Regular season"))
             continue
         status = str(_cell(row, ci["status"]) or "").strip()
+        if exclude_blank_status and ci["status"] is not None and not status:
+            excluded += 1
+            annotations.append((False, "Status: (blank)"))
+            continue
         if _is_nonactive(status):
             excluded += 1
             annotations.append((False, f"Status: {status}"))
