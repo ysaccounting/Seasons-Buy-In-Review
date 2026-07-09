@@ -632,7 +632,7 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
         widx = _col_index(header, colname)
         if widx is not None:
             where_checks.append((colname, widx, {v.lower() for v in badvals}))
-    for row in data_rows:
+    for idx, row in enumerate(data_rows):
         team = _normalize_team(_cell(row, ci["team"]), league)
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
@@ -703,6 +703,7 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
             "row_n": _row(_cell(row, ci["row"])),
             "is_parking": is_parking,
             "is_flex": is_flex,
+            "_data_idx": idx,
         })
         annotations.append((True, ""))
     return out, excluded, annotations
@@ -810,6 +811,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
 
         for x in own_matches:      # these PV rows have a matching HAL record
             x["_hal"] = True
+            if r.get("_hal_tab_row"):
+                x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
 
         wc, woc, tv_cost = _games_split(own_matches, apportion)
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
@@ -889,6 +892,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 if cost_ok and games_ok:
                     for x in ms:      # matched under a different email
                         x["_hal"] = True
+                        if r.get("_hal_tab_row"):
+                            x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
                     alt = {**base, "TV Total Cost": a_cost,
                            "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
                     not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
@@ -1143,9 +1148,12 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     _build_source_tab(wb.create_sheet("HAL"),
                       ["Included in Rec?", "Reason not Included"], [16, 32],
                       hal_blocks[0][0] if hal_blocks else [], hal_blocks, clean_seats=True)
-    pv_block = [(("Yes",) if x.get("_hal") else ("No",), x["raw"]) for x in pv_rows]
+    pv_block = [(("Yes" if x.get("_hal") else "No",
+                  ", ".join(str(n) for n in sorted(x.get("_hal_rows", ())))), x["raw"])
+                for x in pv_rows]
     _build_source_tab(wb.create_sheet("Purchase Details"),
-                      ["HAL Record?"], [14], pv_header, [(pv_header, pv_block)])
+                      ["HAL Record?", "HAL Row #"], [14, 12], pv_header,
+                      [(pv_header, pv_block)])
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -1210,6 +1218,7 @@ def process():
         # ---- HAL: records + raw source blocks, grouped by company ---------- #
         hal_by_company = OrderedDict()
         hal_src_by_company = {}
+        hal_next_start = {}   # company -> Excel row where the next block's header goes
         excluded_total = 0
         for i, f in enumerate(hal_files):
             company = (hal_companies[i] if i < len(hal_companies) else "").strip()
@@ -1217,11 +1226,19 @@ def process():
                 return jsonify({"error": f"Choose a company for “{f.filename}”."}), 400
             raw = _rows_from_upload(f.filename, f.read())
             recs, excluded, annotations = parse_hal(raw, f.filename, company, year, league, sel_type)
-            hal_by_company.setdefault(company, []).extend(recs)
             hidx, _ = _find_header_row(raw)
             hdr = raw[hidx] if hidx < len(raw) else []
+            data = raw[hidx + 1:]
+            # each broker's HAL tab lays out: header row, then one row per data
+            # row, then a blank row before the next stacked file. Record the HAL
+            # tab row number so Purchase Details can point back to it.
+            block_start = hal_next_start.get(company, 1)
+            for rec in recs:
+                rec["_hal_tab_row"] = block_start + 1 + rec["_data_idx"]
+            hal_next_start[company] = block_start + 1 + len(data) + 1
+            hal_by_company.setdefault(company, []).extend(recs)
             annotated = [(("Yes", "") if inc else ("No", reason), rawrow)
-                         for (inc, reason), rawrow in zip(annotations, raw[hidx + 1:])]
+                         for (inc, reason), rawrow in zip(annotations, data)]
             hal_src_by_company.setdefault(company, []).append((hdr, annotated))
             excluded_total += excluded
         if not any(hal_by_company.values()):
