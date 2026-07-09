@@ -894,8 +894,11 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             continue
 
         # nothing under the account's own email — look for the same seats under a
-        # DIFFERENT email in this broker's vault (same team/sec/row). When HAL has
-        # no seats, match on section + row alone.
+        # DIFFERENT email in this broker's vault (same team/sec/row, seat overlap).
+        # If found, it's a "different email address" case even when the cost/games
+        # don't tie (those variances are appended and shown); only when the seats
+        # aren't found under any email is it "Not Bought In".
+        matched = False
         if not r["is_parking"] and r["sec_n"] and r["row_n"]:
             hs = _seatnums(r["Seats"])
             cands = secondary_index.get((r["team"], r["row_n"]), [])
@@ -904,23 +907,33 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 if (x["email"] not in own and _sec_match(x["sec"], r["sec_n"])
                         and ((not hs) or (x["seatset"] & hs))):
                     by_email[x["email"]].append(x)
+            best = None   # (ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms)
             for alt_email, ms in by_email.items():
                 a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
                 cost_ok = _cost_ok(a_cost, r["total"])
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
-                if cost_ok and games_ok:
-                    for x in ms:      # matched under a different email
-                        x["_hal"] = True
-                        if r.get("_hal_tab_row"):
-                            x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
-                    alt = {**base, "TV Total Cost": a_cost,
-                           "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
-                    not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
-                                           "Notes": "Email Address", "_p": 2})
-                    break
-            else:
-                not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not Bought In", "_p": 0})
-        else:
+                cand = (cost_ok and games_ok, cost_ok, games_ok, a_cost,
+                        alt_email, a_wc, a_woc, ms)
+                # prefer a clean tie, then the most complete (highest cost)
+                if best is None or (cand[0], cand[3]) > (best[0], best[3]):
+                    best = cand
+            if best is not None:
+                ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms = best
+                for x in ms:      # matched under a different email
+                    x["_hal"] = True
+                    if r.get("_hal_tab_row"):
+                        x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
+                alt = {**base, "TV Total Cost": a_cost,
+                       "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
+                notes = ["Email Address"]
+                if not games_ok:
+                    notes.append("# Games")
+                if not cost_ok:
+                    notes.append("Total Cost")
+                not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
+                                       "Notes": ", ".join(notes), "_p": 2})
+                matched = True
+        if not matched:
             not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not Bought In", "_p": 0})
 
     reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
