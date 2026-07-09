@@ -452,7 +452,8 @@ def _is_flex_hal(full_partial, section, row, seats):
 # shouldn't be reconciled. (You may also strip these before uploading.)
 NONACTIVE_KEYWORDS = ("deposit", "wait list", "waiting", "waitlist", "waitlisted",
                       "inquir", "notification", "cancel", "nothing for this",
-                      "back and forth", "pending", "declined", "not renew")
+                      "back and forth", "pending", "declined", "not renew",
+                      "opted out", "opt out", "no invoice", "refund")
 
 
 def _is_nonactive(full_partial):
@@ -480,6 +481,10 @@ COMPANY_TOTAL_COLS = {
 COMPANY_EXCLUDE_WHERE = {
     "ttg": [("Regular", {"no"})],
 }
+
+# Companies that don't track # of games on their HAL — reconcile on cost alone
+# (skip the games comparison).
+COMPANY_SKIP_GAMES = {"katz"}
 
 
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
@@ -554,6 +559,8 @@ def parse_hal(rows, filename, company, year="", league=""):
             ci["total"] = idx
     if ci["fp"] is None:
         ci["fp"] = _col_index(header, *_year_plan_cols(year))
+    if ci["status"] is None:   # any column whose header contains "status"
+        ci["status"] = next((i for i, h in enumerate(header) if "status" in h), None)
     out, excluded = [], 0
     exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
     where_checks = []
@@ -744,7 +751,10 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         if own_matches:
             cost_ok = abs(tv_cost - r["total"]) <= tolerance
             games_known = r["games"] is not None
-            if zero_parking:
+            skip_games = str(r["company"]).strip().lower() in COMPANY_SKIP_GAMES
+            if skip_games:
+                games_ok = True
+            elif zero_parking:
                 games_ok = games_known and woc == r["games"]
             else:
                 games_ok = games_known and wc == r["games"]
