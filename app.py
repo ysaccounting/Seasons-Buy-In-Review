@@ -838,7 +838,7 @@ RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0]
 RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12)]
 RECON_COST = {9, 10}
 
-NR_COLS = ["Discrepancies", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
+NR_COLS = ["Variances", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
            "Total Cost", "Total Cost", "# Games w/Cost", "Email Address"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
@@ -922,7 +922,9 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
             for j, v in enumerate(row_vals, 1):
                 if seat_i is not None and (j - 1) == seat_i:
                     v = _seat_text(v)
-                ws.cell(r, j, _src_val(v)).font = Font(name=ARIAL, size=9)
+                cell = ws.cell(r, j, _src_val(v))
+                cell.font = Font(name=ARIAL, size=9)
+                cell.alignment = CENTER
             r += 1
         if first:
             ws.freeze_panes = f"{get_column_letter(np + 1)}{hdr_row + 1}"
