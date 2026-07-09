@@ -561,29 +561,38 @@ def parse_hal(rows, filename, company, year="", league=""):
         ci["fp"] = _col_index(header, *_year_plan_cols(year))
     if ci["status"] is None:   # any column whose header contains "status"
         ci["status"] = next((i for i, h in enumerate(header) if "status" in h), None)
-    out, excluded = [], 0
+    out, excluded, annotations = [], 0, []
     exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
     where_checks = []
     for colname, badvals in COMPANY_EXCLUDE_WHERE.get(str(company).strip().lower(), []):
         widx = _col_index(header, colname)
         if widx is not None:
-            where_checks.append((widx, {v.lower() for v in badvals}))
+            where_checks.append((colname, widx, {v.lower() for v in badvals}))
     for row in data_rows:
         team = _normalize_team(_cell(row, ci["team"]), league)
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
+            annotations.append((False, "No team or email"))
             continue
         fp = str(_cell(row, ci["fp"]) or "").strip()
         status = str(_cell(row, ci["status"]) or "").strip()
-        if _is_nonactive(fp) or _is_nonactive(status):
+        if _is_nonactive(status):
             excluded += 1
+            annotations.append((False, f"Status: {status}"))
+            continue
+        if _is_nonactive(fp):
+            excluded += 1
+            annotations.append((False, f"Plan: {fp}"))
             continue
         if fp.lower() in exclude_types:
             excluded += 1
+            annotations.append((False, f"Excluded plan type: {fp}"))
             continue
-        if any(str(_cell(row, widx) or "").strip().lower() in badvals
-               for widx, badvals in where_checks):
+        where_hit = next(((cn, _cell(row, wi)) for cn, wi, bv in where_checks
+                          if str(_cell(row, wi) or "").strip().lower() in bv), None)
+        if where_hit:
             excluded += 1
+            annotations.append((False, f"{where_hit[0]} = {where_hit[1]}"))
             continue
         games = _amount(_cell(row, ci["games"]))
         section = str(_cell(row, ci["section"]) or "").strip()
@@ -595,6 +604,7 @@ def parse_hal(rows, filename, company, year="", league=""):
         # deposit/waitlist placeholder; omit unless it's parking or flex.
         if not section and not row_v and not seats and not is_parking and not is_flex:
             excluded += 1
+            annotations.append((False, "No section, row or seats"))
             continue
         out.append({
             "company": company,
@@ -613,7 +623,8 @@ def parse_hal(rows, filename, company, year="", league=""):
             "is_parking": is_parking,
             "is_flex": is_flex,
         })
-    return out, excluded
+        annotations.append((True, ""))
+    return out, excluded, annotations
 
 
 def parse_details(rows, filename, league=""):
@@ -708,6 +719,9 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             else:
                 own_matches = []
 
+        for x in own_matches:      # these PV rows have a matching HAL record
+            x["_hal"] = True
+
         wc, woc, tv_cost = _games_split(own_matches)
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
         # Compare HAL # games against TV games WITHOUT cost instead of with cost.
@@ -742,10 +756,10 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 reconciled.append(base)
             elif own_matches:
                 not_reconciled.append({**base, **variances(tv_cost, wc, woc),
-                                        "Notes": "total cost not equal", "_p": 1})
+                                        "Notes": "Total Cost", "_p": 1})
             else:
                 not_reconciled.append({**base, **variances(0.0, 0, 0),
-                                        "Notes": "Not bought in", "_p": 0})
+                                        "Notes": "Not Bought In", "_p": 0})
             continue
 
         if own_matches:
@@ -762,10 +776,10 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 reconciled.append(base)
                 continue
             parts = []
-            if not cost_ok:
-                parts.append("total cost not equal")
             if not games_ok:
-                parts.append("# games not in HAL" if not games_known else "# games not equal")
+                parts.append("# Games")
+            if not cost_ok:
+                parts.append("Total Cost")
             not_reconciled.append({**base, **variances(tv_cost, wc, woc),
                                     "Notes": ", ".join(parts), "_p": 1})
             continue
@@ -785,15 +799,17 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 cost_ok = abs(a_cost - r["total"]) <= tolerance
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
                 if cost_ok and games_ok:
+                    for x in ms:      # matched under a different email
+                        x["_hal"] = True
                     alt = {**base, "TV Total Cost": a_cost,
                            "# Games w/Cost": a_wc, "# Games w/o Cost": a_woc}
                     not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
-                                           "Notes": "different email address", "_p": 2})
+                                           "Notes": "Email Address", "_p": 2})
                     break
             else:
-                not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not bought in", "_p": 0})
+                not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not Bought In", "_p": 0})
         else:
-            not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not bought in", "_p": 0})
+            not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not Bought In", "_p": 0})
 
     reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
     not_reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
@@ -822,7 +838,7 @@ RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0]
 RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12)]
 RECON_COST = {9, 10}
 
-NR_COLS = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
+NR_COLS = ["Discrepancies", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
            "Total Cost", "Total Cost", "# Games w/Cost", "Email Address"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
@@ -878,20 +894,22 @@ def _src_val(v):
     return str(v)
 
 
-def _build_source_tab(ws, header, blocks, clean_seats=False):
-    """Dump raw source rows (header + data). `blocks` is a list of (header, rows)
-    so multiple files for one company stack. `header` is a fallback header. When
-    clean_seats is set, the Seats column is shown the way the app parses it
-    (e.g. a date-corrupted '2026-06-08' becomes '6-8')."""
+def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean_seats=False):
+    """Dump raw source rows (header + data) with optional prepended columns.
+    `blocks` is a list of (block_header, rows); each row is (prepend_values, raw).
+    When clean_seats is set, the raw Seats column is shown the parsed way."""
     ws.sheet_view.showGridLines = False
+    np = len(prepend_headers)
     max_cols = 1
     r = 1
     first = True
     for blk_header, blk_rows in blocks:
-        hdr = blk_header or header
+        raw_hdr = list(blk_header or header)
+        hdr = list(prepend_headers) + raw_hdr
         seat_i = None
         if clean_seats:
-            seat_i = _col_index([_norm_header(c) for c in hdr], *HAL_SYNONYMS["seats"])
+            si = _col_index([_norm_header(c) for c in raw_hdr], *HAL_SYNONYMS["seats"])
+            seat_i = (np + si) if si is not None else None
         for j, h in enumerate(hdr, 1):
             cell = ws.cell(r, j, _src_val(h))
             cell.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF")
@@ -899,19 +917,21 @@ def _build_source_tab(ws, header, blocks, clean_seats=False):
         max_cols = max(max_cols, len(hdr))
         hdr_row = r
         r += 1
-        for row in blk_rows:
-            for j, v in enumerate(row, 1):
+        for prepend_vals, raw in blk_rows:
+            row_vals = list(prepend_vals) + list(raw)
+            for j, v in enumerate(row_vals, 1):
                 if seat_i is not None and (j - 1) == seat_i:
                     v = _seat_text(v)
                 ws.cell(r, j, _src_val(v)).font = Font(name=ARIAL, size=9)
             r += 1
         if first:
-            ws.freeze_panes = f"A{hdr_row + 1}"
+            ws.freeze_panes = f"{get_column_letter(np + 1)}{hdr_row + 1}"
             ws.auto_filter.ref = f"A{hdr_row}:{get_column_letter(max(max_cols, 1))}{r - 1}"
             first = False
         r += 1  # blank row between stacked files
     for j in range(1, max_cols + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 16
+        ws.column_dimensions[get_column_letter(j)].width = (
+            prepend_widths[j - 1] if j <= np else 16)
 
 
 def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
@@ -923,8 +943,8 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     p_nr = [r for r in not_reconciled if r.get("_parking")]
     f_nr = [r for r in not_reconciled if r.get("_flex")]
     rec_n, nr_n = len(reconciled), len(not_reconciled)
-    nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not bought in")
-    de = sum(1 for r in not_reconciled if r["Notes"] == "different email address")
+    nbi = sum(1 for r in not_reconciled if r["Notes"] == "Not Bought In")
+    de = sum(1 for r in not_reconciled if r["Notes"] == "Email Address")
     mismatch = nr_n - nbi - de
 
     wb = Workbook()
@@ -996,9 +1016,12 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
                       f_nr, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Source data ---------------------------------------------------- #
-    _build_source_tab(wb.create_sheet("HAL"), hal_blocks[0][0] if hal_blocks else [], hal_blocks,
-                      clean_seats=True)
-    _build_source_tab(wb.create_sheet("Purchase Details"), pv_header, [(pv_header, pv_rows)])
+    _build_source_tab(wb.create_sheet("HAL"),
+                      ["Included in Rec?", "Reason not Included"], [16, 32],
+                      hal_blocks[0][0] if hal_blocks else [], hal_blocks, clean_seats=True)
+    pv_block = [(("Yes",) if x.get("_hal") else ("No",), x["raw"]) for x in pv_rows]
+    _build_source_tab(wb.create_sheet("Purchase Details"),
+                      ["HAL Record?"], [14], pv_header, [(pv_header, pv_block)])
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -1065,11 +1088,13 @@ def process():
             if not company:
                 return jsonify({"error": f"Choose a company for “{f.filename}”."}), 400
             raw = _rows_from_upload(f.filename, f.read())
-            recs, excluded = parse_hal(raw, f.filename, company, year, league)
+            recs, excluded, annotations = parse_hal(raw, f.filename, company, year, league)
             hal_by_company.setdefault(company, []).extend(recs)
             hidx, _ = _find_header_row(raw)
             hdr = raw[hidx] if hidx < len(raw) else []
-            hal_src_by_company.setdefault(company, []).append((hdr, raw[hidx + 1:]))
+            annotated = [(("Yes", "") if inc else ("No", reason), rawrow)
+                         for (inc, reason), rawrow in zip(annotations, raw[hidx + 1:])]
+            hal_src_by_company.setdefault(company, []).append((hdr, annotated))
             excluded_total += excluded
         if not any(hal_by_company.values()):
             return jsonify({"error": "No season-ticket records found in the HAL file(s)."}), 400
@@ -1086,16 +1111,15 @@ def process():
         if detail_rows == 0:
             return jsonify({"error": "No usable rows found in the Purchase Details file(s)."}), 400
 
-        # build a company-scoped vault per broker (Master Mapping List). Vendor
-        # rows are kept in the source dump but skipped when matching.
-        vault = {}   # broker -> {primary, secondary, raw}
+        # build a company-scoped vault per broker (Master Mapping List).
+        vault = {}   # broker -> {primary, secondary, rows}
         for x in pv_parsed:
             broker = PVCOMPANY_TO_BROKER.get(x["company_norm"])
             if not broker:
                 continue
             vb = vault.setdefault(broker, {"primary": defaultdict(list),
-                                           "secondary": defaultdict(list), "raw": []})
-            vb["raw"].append(x["raw"])
+                                           "secondary": defaultdict(list), "rows": []})
+            vb["rows"].append(x)
             vb["primary"][(x["email"], x["team"])].append(x)
             if not x["is_parking"]:
                 vb["secondary"][(x["team"], x["sec"], x["row"])].append(x)
@@ -1107,11 +1131,11 @@ def process():
         reports = []
         tot_rec = tot_nr = 0
         for company, recs in hal_by_company.items():
-            vb = vault.get(company, {"primary": {}, "secondary": {}, "raw": []})
+            vb = vault.get(company, {"primary": {}, "secondary": {}, "rows": []})
             reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
             data, m = build_workbook(company, league, year, as_of_fmt, reconciled, not_reconciled,
                                      len(recs), tolerance, hal_src_by_company.get(company, []),
-                                     pv_header, vb["raw"])
+                                     pv_header, vb["rows"])
             fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
                      f"{_safe_name(year)} - As Of {_safe_name(as_of_fmt)}.xlsx")
             with open(os.path.join(folder, fname), "wb") as fh:
