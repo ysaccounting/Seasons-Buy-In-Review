@@ -239,7 +239,18 @@ def _normalize_team(name, league):
             return idx[cand]
     return raw
 
-DEFAULT_TOLERANCE = 5.00  # dollars; TV total must tie to HAL total within this
+DEFAULT_TOLERANCE = 5.00  # kept for the /process tolerance field (unused by _cost_ok)
+
+# Total-cost variance is acceptable if within $1 OR within 0.01% of the HAL total.
+COST_ABS_TOL = 1.00
+COST_PCT_TOL = 0.0001   # 0.01%
+
+
+def _cost_ok(tv_cost, hal_total):
+    var = abs(tv_cost - hal_total)
+    if var <= COST_ABS_TOL:
+        return True
+    return bool(hal_total) and (var / abs(hal_total)) <= COST_PCT_TOL
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
@@ -250,6 +261,7 @@ TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
 HAL_SYNONYMS = {
     "company": ["Company", "Client", "Broker", "Group"],
     "league":  ["League", "League New", "Lg"],
+    "year":    ["Year", "Season Year", "Yr", "Season"],
     "status":  ["Account Status", "Status", "Acct Status", "Account State"],
     "email":   ["Email", "Account Email", "Email Address", "Login Email",
                 "Email (from Profiles)", "Account EMAIL", "user Name/email",
@@ -505,6 +517,23 @@ def _is_playoff(*vals):
     return "playoff" in s or "postseason" in s or "post season" in s or "post-season" in s
 
 
+def _year_matches(row_year, selected):
+    """A HAL Year/Season Year value matches the selected season by its STARTING
+    year — 2026-27 -> 2026, so '2026', '2026-2027', '26/27' all match."""
+    m = re.match(r"^(\d{4})-(\d{2})$", str(selected or "").strip())
+    if not m:
+        return True
+    yyyy, yy = m.group(1), m.group(1)[2:]
+    s = str(row_year or "").strip()
+    if not s:
+        return True   # no year on the row — don't filter it out
+    toks = re.findall(r"\d{4}|\d{2}", s)
+    if not toks:
+        return True   # unparseable (e.g. "Deposit") — don't filter
+    first = toks[0]
+    return first == yyyy if len(first) == 4 else first == yy
+
+
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
 
 
@@ -594,6 +623,9 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
             continue
         if ci["league"] is not None and not _league_matches(_cell(row, ci["league"]), league):
             annotations.append((False, f"Not {league}"))
+            continue
+        if ci["year"] is not None and not _year_matches(_cell(row, ci["year"]), year):
+            annotations.append((False, f"Not {year}"))
             continue
         fp = str(_cell(row, ci["fp"]) or "").strip()
         section = str(_cell(row, ci["section"]) or "").strip()
@@ -700,15 +732,21 @@ def parse_details(rows, filename, league=""):
 # Reconciliation
 # --------------------------------------------------------------------------- #
 
-def _games_split(matches):
+def _games_split(matches, hal_seats=None):
     """Return (games_with_cost, games_without_cost, total_cost) for a set of
     matching vault rows. A game counts as 'with cost' if any matching row for
-    that event carries a positive cost."""
+    that event carries a positive cost. When `hal_seats` is given, each row's
+    cost is apportioned by the fraction of its seats that the HAL row covers —
+    so a HAL block that is part of a larger TicketVault block gets only its
+    share (e.g. HAL seats 9-10 of a TV 7-10 block = half the cost)."""
     ev = defaultdict(float)
     total = 0.0
     for x in matches:
-        ev[x["event"]] = max(ev[x["event"]], x["cost"])
-        total += x["cost"]
+        cost = x["cost"]
+        if hal_seats is not None and x["seatset"]:
+            cost *= len(x["seatset"] & hal_seats) / len(x["seatset"])
+        ev[x["event"]] = max(ev[x["event"]], cost)
+        total += cost
     wc = sum(1 for v in ev.values() if v > 0)
     woc = sum(1 for v in ev.values() if v == 0)
     return wc, woc, round(total, 2)
@@ -722,6 +760,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         for e in r["emails"]:
             vr.extend(primary_index.get((e, r["team"]), []))
 
+        apportion = None
         if not vr:
             own_matches = []
         elif r["is_flex"]:
@@ -740,6 +779,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 own_matches = [x for x in vr if (not x["is_parking"])
                                and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
                                and (x["seatset"] & hs)]
+                apportion = hs   # HAL block may be part of a larger TV block
             elif r["sec_n"] and r["row_n"]:
                 # seats missing on HAL — reconcile on section + row if the rest ties
                 own_matches = [x for x in vr if (not x["is_parking"])
@@ -750,7 +790,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         for x in own_matches:      # these PV rows have a matching HAL record
             x["_hal"] = True
 
-        wc, woc, tv_cost = _games_split(own_matches)
+        wc, woc, tv_cost = _games_split(own_matches, apportion)
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
         # Compare HAL # games against TV games WITHOUT cost instead of with cost.
         zero_parking = r["is_parking"] and r["total"] == 0
@@ -780,7 +820,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # flex / ticket-bank: no seats to match — reconcile when the TicketVault
         # spend for this email+team is at least the HAL credit.
         if r["is_flex"]:
-            if own_matches and (tv_cost + tolerance >= r["total"]):
+            if own_matches and (tv_cost >= r["total"] or _cost_ok(tv_cost, r["total"])):
                 reconciled.append(base)
             elif own_matches:
                 not_reconciled.append({**base, **variances(tv_cost, wc, woc),
@@ -791,7 +831,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             continue
 
         if own_matches:
-            cost_ok = abs(tv_cost - r["total"]) <= tolerance
+            cost_ok = _cost_ok(tv_cost, r["total"])
             games_known = r["games"] is not None
             if not games_known:
                 games_ok = True   # HAL has no game count — reconcile on cost alone
@@ -822,8 +862,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 if x["email"] not in own and ((not hs) or (x["seatset"] & hs)):
                     by_email[x["email"]].append(x)
             for alt_email, ms in by_email.items():
-                a_wc, a_woc, a_cost = _games_split(ms)
-                cost_ok = abs(a_cost - r["total"]) <= tolerance
+                a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
+                cost_ok = _cost_ok(a_cost, r["total"])
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
                 if cost_ok and games_ok:
                     for x in ms:      # matched under a different email
