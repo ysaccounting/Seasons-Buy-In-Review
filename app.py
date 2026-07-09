@@ -821,7 +821,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # spend for this email+team is at least the HAL credit.
         if r["is_flex"]:
             if own_matches and (tv_cost >= r["total"] or _cost_ok(tv_cost, r["total"])):
-                reconciled.append(base)
+                reconciled.append({**base, **variances(tv_cost, wc, woc)})
             elif own_matches:
                 not_reconciled.append({**base, **variances(tv_cost, wc, woc),
                                         "Notes": "Total Cost", "_p": 1})
@@ -840,7 +840,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             else:
                 games_ok = wc == r["games"]
             if cost_ok and games_ok:
-                reconciled.append(base)
+                reconciled.append({**base, **variances(tv_cost, wc, woc)})
                 continue
             parts = []
             if not games_ok:
@@ -898,12 +898,16 @@ BLUE = "2E5496"
 CENTER = Alignment(horizontal="center")
 
 RECON_COLS = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
-              "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost"]
+              "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
+              "Total Cost", "Total Cost"]
 RECON_SRC = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
-             "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost"]
-RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0]
-RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12)]
-RECON_COST = {9, 10}
+             "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
+             "Var Total Cost", "Var Total Cost %"]
+RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0, 13.0, 13.0]
+RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12),
+               ("Variances", VAR_FILL, 13, 14)]
+RECON_COST = {9, 10, 13}
+RECON_PCT = {14}
 
 NR_COLS = ["Variances", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
@@ -1090,19 +1094,19 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
 
     # ---- Tickets: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
-                      t_rec, RECON_BANDS, RECON_COST)
+                      t_rec, RECON_BANDS, RECON_COST, RECON_PCT)
     _build_detail_tab(wb.create_sheet("Not Reconciled"), NR_COLS, NR_SRC, NR_W,
                       t_nr, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Parking: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Parking Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
-                      p_rec, RECON_BANDS, RECON_COST)
+                      p_rec, RECON_BANDS, RECON_COST, RECON_PCT)
     _build_detail_tab(wb.create_sheet("Parking Not Reconciled"), NR_COLS, NR_SRC, NR_W,
                       p_nr, NR_BANDS, NR_COST, NR_PCT)
 
     # ---- Flex / ticket-bank: Reconciled / Not Reconciled ---------------- #
     _build_detail_tab(wb.create_sheet("Flex Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
-                      f_rec, RECON_BANDS, RECON_COST)
+                      f_rec, RECON_BANDS, RECON_COST, RECON_PCT)
     _build_detail_tab(wb.create_sheet("Flex Not Reconciled"), NR_COLS, NR_SRC, NR_W,
                       f_nr, NR_BANDS, NR_COST, NR_PCT)
 
