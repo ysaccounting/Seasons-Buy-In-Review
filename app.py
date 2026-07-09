@@ -242,12 +242,14 @@ def _normalize_team(name, league):
 DEFAULT_TOLERANCE = 5.00  # dollars; TV total must tie to HAL total within this
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
+TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
 
 # Different companies label their HAL columns differently. Each HAL field maps to
 # every header name we've seen for it (case-insensitive). To support a new company
 # whose layout differs, add its header names to the relevant list here.
 HAL_SYNONYMS = {
     "company": ["Company", "Client", "Broker", "Group"],
+    "league":  ["League", "League New", "Lg"],
     "status":  ["Account Status", "Status", "Acct Status", "Account State"],
     "email":   ["Email", "Account Email", "Email Address", "Login Email",
                 "Email (from Profiles)", "Account EMAIL", "user Name/email",
@@ -482,9 +484,25 @@ COMPANY_EXCLUDE_WHERE = {
     "ttg": [("Regular", {"no"})],
 }
 
-# Companies that don't track # of games on their HAL — reconcile on cost alone
-# (skip the games comparison).
-COMPANY_SKIP_GAMES = {"katz"}
+# Companies that don't track # of games on their HAL — reconcile on cost alone.
+# (Now generalized: any HAL row with a blank # games reconciles on cost.)
+
+
+def _league_matches(hal_league, selected):
+    a = re.sub(r"[^a-z]", "", str(hal_league or "").lower())
+    b = re.sub(r"[^a-z]", "", str(selected or "").lower())
+    if not a:
+        return True   # no league on the row — don't filter it out
+    if a == b:
+        return True
+    if a == "ncaa" and b in ("ncaaf", "ncaab"):   # generic NCAA
+        return True
+    return False
+
+
+def _is_playoff(*vals):
+    s = " ".join(str(v or "").lower() for v in vals)
+    return "playoff" in s or "postseason" in s or "post season" in s or "post-season" in s
 
 
 _EMAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
@@ -533,7 +551,7 @@ def _sniff_email_col(header, data_rows):
 # Parsing
 # --------------------------------------------------------------------------- #
 
-def parse_hal(rows, filename, company, year="", league=""):
+def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
     """Parse a HAL season-ticket database. One record per seat block. Column
     names vary by company and are matched via HAL_SYNONYMS (email is also
     sniffed from values). Team names are normalized to TicketVault's canonical
@@ -574,7 +592,19 @@ def parse_hal(rows, filename, company, year="", league=""):
         if not team or not emails:
             annotations.append((False, "No team or email"))
             continue
+        if ci["league"] is not None and not _league_matches(_cell(row, ci["league"]), league):
+            annotations.append((False, f"Not {league}"))
+            continue
         fp = str(_cell(row, ci["fp"]) or "").strip()
+        section = str(_cell(row, ci["section"]) or "").strip()
+        row_v = str(_cell(row, ci["row"]) or "").strip()
+        playoff = _is_playoff(fp, section, row_v)
+        if sel_type == "Regular Season" and playoff:
+            annotations.append((False, "Playoffs"))
+            continue
+        if sel_type == "Playoffs/Postseason" and not playoff:
+            annotations.append((False, "Regular season"))
+            continue
         status = str(_cell(row, ci["status"]) or "").strip()
         if _is_nonactive(status):
             excluded += 1
@@ -595,11 +625,9 @@ def parse_hal(rows, filename, company, year="", league=""):
             annotations.append((False, f"{where_hit[0]} = {where_hit[1]}"))
             continue
         games = _amount(_cell(row, ci["games"]))
-        section = str(_cell(row, ci["section"]) or "").strip()
-        row_v = str(_cell(row, ci["row"]) or "").strip()
         seats = _seat_text(_cell(row, ci["seats"]))
-        is_flex = _is_flex_hal(fp, section, row_v, seats)
-        is_parking = (not is_flex) and _is_parking_hal(fp, section, row_v)
+        is_parking = _is_parking_hal(fp, section, row_v)
+        is_flex = (not is_parking) and _is_flex_hal(fp, section, row_v, seats)
         # no seat location at all (blank section, row and seats) — typically a
         # deposit/waitlist placeholder; omit unless it's parking or flex.
         if not section and not row_v and not seats and not is_parking and not is_flex:
@@ -765,13 +793,12 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         if own_matches:
             cost_ok = abs(tv_cost - r["total"]) <= tolerance
             games_known = r["games"] is not None
-            skip_games = str(r["company"]).strip().lower() in COMPANY_SKIP_GAMES
-            if skip_games:
-                games_ok = True
+            if not games_known:
+                games_ok = True   # HAL has no game count — reconcile on cost alone
             elif zero_parking:
-                games_ok = games_known and woc == r["games"]
+                games_ok = woc == r["games"]
             else:
-                games_ok = games_known and wc == r["games"]
+                games_ok = wc == r["games"]
             if cost_ok and games_ok:
                 reconciled.append(base)
                 continue
@@ -894,6 +921,22 @@ def _src_val(v):
     return str(v)
 
 
+_MONEY_STRONG = ("cost", "price", "amount", "paid", "$", "per seat", "per ticket",
+                 "per game", "per item", "unit price")
+_MONEY_WEAK = ("total", "due", "balance")
+_COUNT_WORDS = ("game", "seat", "qty", "quantity", "count", "num", "#", "row", "sec",
+                "date", "id", "link", "email", "name", "phone", "team", "status", "plan")
+
+
+def _is_money_header(h):
+    hl = re.sub(r"\s+", " ", str(h or "").strip().lower())
+    if any(k in hl for k in _MONEY_STRONG):
+        return True
+    if any(k in hl for k in _MONEY_WEAK) and not any(k in hl for k in _COUNT_WORDS):
+        return True
+    return False
+
+
 def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean_seats=False):
     """Dump raw source rows (header + data) with optional prepended columns.
     `blocks` is a list of (block_header, rows); each row is (prepend_values, raw).
@@ -910,6 +953,7 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
         if clean_seats:
             si = _col_index([_norm_header(c) for c in raw_hdr], *HAL_SYNONYMS["seats"])
             seat_i = (np + si) if si is not None else None
+        money_cols = {np + i for i, h in enumerate(raw_hdr) if _is_money_header(h)}
         for j, h in enumerate(hdr, 1):
             cell = ws.cell(r, j, _src_val(h))
             cell.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF")
@@ -925,6 +969,11 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
                 cell = ws.cell(r, j, _src_val(v))
                 cell.font = Font(name=ARIAL, size=9)
                 cell.alignment = CENTER
+                if (j - 1) in money_cols:
+                    amt = _amount(v)
+                    if amt is not None:
+                        cell.value = amt
+                        cell.number_format = CUR
             r += 1
         if first:
             ws.freeze_panes = f"{get_column_letter(np + 1)}{hdr_row + 1}"
@@ -1047,7 +1096,8 @@ def index():
 
 @app.route("/options")
 def options():
-    return jsonify({"leagues": LEAGUES, "years": YEARS, "companies": COMPANY_NAMES})
+    return jsonify({"leagues": LEAGUES, "years": YEARS, "types": TYPES,
+                    "companies": COMPANY_NAMES})
 
 
 @app.route("/process", methods=["POST"])
@@ -1058,11 +1108,14 @@ def process():
     league = (request.form.get("league") or "").strip()
     year = (request.form.get("year") or "").strip()
     as_of = (request.form.get("as_of") or "").strip()
+    sel_type = (request.form.get("type") or "").strip()
 
     if league not in LEAGUES:
         return jsonify({"error": "Please choose a League."}), 400
     if year not in YEARS:
         return jsonify({"error": "Please choose a Year."}), 400
+    if sel_type not in TYPES:
+        return jsonify({"error": "Please choose a Type."}), 400
     if not as_of:
         return jsonify({"error": "Please choose an As Of Date."}), 400
     as_of_fmt = _fmt_asof(as_of)
@@ -1090,7 +1143,7 @@ def process():
             if not company:
                 return jsonify({"error": f"Choose a company for “{f.filename}”."}), 400
             raw = _rows_from_upload(f.filename, f.read())
-            recs, excluded, annotations = parse_hal(raw, f.filename, company, year, league)
+            recs, excluded, annotations = parse_hal(raw, f.filename, company, year, league, sel_type)
             hal_by_company.setdefault(company, []).extend(recs)
             hidx, _ = _find_header_row(raw)
             hdr = raw[hidx] if hidx < len(raw) else []

@@ -114,6 +114,10 @@
         <select id="year"><option value="" selected disabled>Choose…</option></select>
       </div>
       <div class="control">
+        <label>Type</label>
+        <select id="type"><option value="" selected disabled>Choose…</option></select>
+      </div>
+      <div class="control">
         <label>As Of Date</label>
         <input type="date" id="asof">
       </div>
@@ -157,12 +161,14 @@
 <script>
   let LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"];
   let YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"];
+  let TYPES = ["Regular Season", "Playoffs/Postseason", "Both"];
   let COMPANIES = ["Y&S", "Grossman", "Sternbuch", "Pollak", "Levine", "Levovitz",
                    "Chase", "Asher", "Katz", "GK", "TL", "Waxler", "TTG", "YourTix"];
 
   const store = { hal: [], details: [] };
   const leagueSel = document.getElementById('league');
   const yearSel = document.getElementById('year');
+  const typeSel = document.getElementById('type');
   const asofInput = document.getElementById('asof');
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
@@ -174,12 +180,14 @@
   }
   fillSelect(leagueSel, LEAGUES);
   fillSelect(yearSel, YEARS);
+  fillSelect(typeSel, TYPES);
   fetch('/options').then(r => r.json()).then(d => {
     if (d.leagues) { LEAGUES = d.leagues; leagueSel.length = 1; fillSelect(leagueSel, LEAGUES); }
     if (d.years) { YEARS = d.years; yearSel.length = 1; fillSelect(yearSel, YEARS); }
+    if (d.types) { TYPES = d.types; typeSel.length = 1; fillSelect(typeSel, TYPES); }
     if (d.companies && d.companies.length) { COMPANIES = d.companies; render('hal'); }
   }).catch(() => {});
-  [leagueSel, yearSel].forEach(s => s.addEventListener('change', () => {
+  [leagueSel, yearSel, typeSel].forEach(s => s.addEventListener('change', () => {
     s.classList.toggle('need', !s.value); updateBtn();
   }));
   asofInput.addEventListener('change', () => {
@@ -251,7 +259,7 @@
   }
 
   function ready() {
-    if (!leagueSel.value || !yearSel.value || !asofInput.value) return false;
+    if (!leagueSel.value || !yearSel.value || !typeSel.value || !asofInput.value) return false;
     if (!store.hal.length || !store.details.length) return false;
     if (store.hal.some(e => !e.company)) return false;
     return true;
@@ -283,6 +291,7 @@
     const fd = new FormData();
     fd.append('league', leagueSel.value);
     fd.append('year', yearSel.value);
+    fd.append('type', typeSel.value);
     fd.append('as_of', asofInput.value);
     store.hal.forEach(e => { fd.append('hal', e.file); fd.append('hal_company', e.company); });
     store.details.forEach(e => fd.append('details', e.file));
