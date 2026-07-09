@@ -241,9 +241,9 @@ def _normalize_team(name, league):
 
 DEFAULT_TOLERANCE = 5.00  # kept for the /process tolerance field (unused by _cost_ok)
 
-# Total-cost variance is acceptable if within $1 OR within 0.01% of the HAL total.
-COST_ABS_TOL = 1.00
-COST_PCT_TOL = 0.0001   # 0.01%
+# Total-cost variance is acceptable if within $2 OR within 0.02% of the HAL total.
+COST_ABS_TOL = 2.00
+COST_PCT_TOL = 0.0002   # 0.02%
 
 
 def _cost_ok(tv_cost, hal_total):
@@ -561,6 +561,16 @@ def _year_plan_cols(year):
     return [f"{yyyy} Plan", f"{yy} Plan"]
 
 
+def _year_status_cols(year):
+    """Some HALs carry a status column per season year (Y&S MLB has both
+    '25/26 Status' and '26/27 Status'); pick the one for the selected year."""
+    t = _year_tokens(year)
+    if not t:
+        return []
+    yyyy, yy, nn = t
+    return [f"{yy}/{nn} Status", f"{yy}-{nn} Status", f"{yyyy} Status", f"{yy} Status"]
+
+
 def _sniff_email_col(header, data_rows):
     """When no email header matches (GK stores it under 'Profiles', TL under
     'Name'), pick the column whose values most look like email addresses."""
@@ -606,7 +616,9 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
             ci["total"] = idx
     if ci["fp"] is None:
         ci["fp"] = _col_index(header, *_year_plan_cols(year))
-    if ci["status"] is None:   # any column whose header contains "status"
+    if ci["status"] is None:   # year-named status column (e.g. '26/27 Status')
+        ci["status"] = _col_index(header, *_year_status_cols(year))
+    if ci["status"] is None:   # any other column whose header contains "status"
         ci["status"] = next((i for i, h in enumerate(header) if "status" in h), None)
     out, excluded, annotations = [], 0, []
     exclude_types = COMPANY_EXCLUDE_TYPES.get(str(company).strip().lower(), set())
@@ -988,8 +1000,13 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
     ws.sheet_view.showGridLines = False
     np = len(prepend_headers)
     max_cols = 1
+    colmax = {}   # 1-based col -> widest content seen
     r = 1
     first = True
+
+    def note(j, text):
+        colmax[j] = max(colmax.get(j, 0), len(str(text)))
+
     for blk_header, blk_rows in blocks:
         raw_hdr = list(blk_header or header)
         hdr = list(prepend_headers) + raw_hdr
@@ -1002,6 +1019,7 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
             cell = ws.cell(r, j, _src_val(h))
             cell.font = Font(name=ARIAL, size=9, bold=True, color="FFFFFF")
             cell.fill = PatternFill("solid", fgColor=NAVY); cell.alignment = CENTER
+            note(j, h)
         max_cols = max(max_cols, len(hdr))
         hdr_row = r
         r += 1
@@ -1018,6 +1036,7 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
                     if amt is not None:
                         cell.value = amt
                         cell.number_format = CUR
+                note(j, cell.value if cell.value is not None else "")
             r += 1
         if first:
             ws.freeze_panes = f"{get_column_letter(np + 1)}{hdr_row + 1}"
@@ -1025,8 +1044,9 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
             first = False
         r += 1  # blank row between stacked files
     for j in range(1, max_cols + 1):
-        ws.column_dimensions[get_column_letter(j)].width = (
-            prepend_widths[j - 1] if j <= np else 16)
+        fit = colmax.get(j, 0) + 2
+        base = prepend_widths[j - 1] if j <= np else 10
+        ws.column_dimensions[get_column_letter(j)].width = min(max(base, fit), 80)
 
 
 def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
