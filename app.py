@@ -213,7 +213,10 @@ def _build_team_index(full_names, extra_aliases):
 
 TEAM_INDEX = {
     "NFL": _build_team_index(NFL_TEAMS, NFL_ALIASES),
-    "MLB": _build_team_index(MLB_TEAMS, {}),
+    "MLB": _build_team_index(MLB_TEAMS, {
+        "a's": "Oakland Athletics", "oakland a's": "Oakland Athletics",
+        "athletics": "Oakland Athletics", "sacramento athletics": "Oakland Athletics",
+        "las vegas athletics": "Oakland Athletics"}),
     "NBA": _build_team_index(NBA_TEAMS, {}),
     "NHL": _build_team_index(NHL_TEAMS, {}),
 }
@@ -398,6 +401,21 @@ def _team(cell):
 
 def _sec(cell):
     return re.sub(r"\s+", " ", str(cell or "").strip().upper())
+
+
+def _sec_match(a, b):
+    """Sections match if equal, or if one is the other with a leading alpha
+    prefix (e.g. '505' vs 'SEC505', '4' vs 'G4'). Only a prefix-vs-plain form
+    matches — 'A1' and 'B1' (two different prefixes) do NOT."""
+    if a == b:
+        return True
+    sa = re.sub(r"^[A-Z]+\s*", "", a)   # a with any leading letters removed
+    if sa and sa == b and re.search(r"\d", sa):
+        return True
+    sb = re.sub(r"^[A-Z]+\s*", "", b)
+    if sb and sb == a and re.search(r"\d", sb):
+        return True
+    return False
 
 
 def _row(cell):
@@ -792,20 +810,20 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             # summed against each single HAL row; fall back to all of the team's
             # parking when the lot/seat numbers don't line up.
             hs = _seatnums(r["Seats"])
-            seat_m = [x for x in vr if x["is_parking"] and x["sec"] == r["sec_n"]
+            seat_m = [x for x in vr if x["is_parking"] and _sec_match(x["sec"], r["sec_n"])
                       and x["row"] == r["row_n"] and hs and (x["seatset"] & hs)]
             own_matches = seat_m if seat_m else [x for x in vr if x["is_parking"]]
         else:
             hs = _seatnums(r["Seats"])
             if hs:
                 own_matches = [x for x in vr if (not x["is_parking"])
-                               and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]
+                               and _sec_match(x["sec"], r["sec_n"]) and x["row"] == r["row_n"]
                                and (x["seatset"] & hs)]
                 apportion = hs   # HAL block may be part of a larger TV block
             elif r["sec_n"] and r["row_n"]:
                 # seats missing on HAL — reconcile on section + row if the rest ties
                 own_matches = [x for x in vr if (not x["is_parking"])
-                               and x["sec"] == r["sec_n"] and x["row"] == r["row_n"]]
+                               and _sec_match(x["sec"], r["sec_n"]) and x["row"] == r["row_n"]]
             else:
                 own_matches = []
 
@@ -880,10 +898,11 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # no seats, match on section + row alone.
         if not r["is_parking"] and r["sec_n"] and r["row_n"]:
             hs = _seatnums(r["Seats"])
-            cands = secondary_index.get((r["team"], r["sec_n"], r["row_n"]), [])
+            cands = secondary_index.get((r["team"], r["row_n"]), [])
             by_email = defaultdict(list)
             for x in cands:
-                if x["email"] not in own and ((not hs) or (x["seatset"] & hs)):
+                if (x["email"] not in own and _sec_match(x["sec"], r["sec_n"])
+                        and ((not hs) or (x["seatset"] & hs))):
                     by_email[x["email"]].append(x)
             for alt_email, ms in by_email.items():
                 a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
@@ -1267,7 +1286,7 @@ def process():
             vb["rows"].append(x)
             vb["primary"][(x["email"], x["team"])].append(x)
             if not x["is_parking"]:
-                vb["secondary"][(x["team"], x["sec"], x["row"])].append(x)
+                vb["secondary"][(x["team"], x["row"])].append(x)
 
         token = uuid.uuid4().hex
         folder = os.path.join(STORE_DIR, token)
