@@ -254,6 +254,28 @@ def _cost_ok(tv_cost, hal_total):
     if var <= COST_ABS_TOL:
         return True
     return bool(hal_total) and (var / abs(hal_total)) <= COST_PCT_TOL
+
+
+# Canadian teams bill their HAL in CAD, but TicketVault records USD at a rate
+# usually between 70% and 75%. Try each rate (1% steps) when reconciling them.
+CANADIAN_TEAMS = {
+    "Toronto Blue Jays", "Toronto Raptors", "Toronto Maple Leafs",
+    "Montreal Canadiens", "Ottawa Senators", "Vancouver Canucks",
+    "Calgary Flames", "Edmonton Oilers", "Winnipeg Jets",
+    "Toronto FC", "Vancouver Whitecaps FC", "Vancouver Whitecaps", "CF Montreal",
+}
+FX_RATES = [round(0.70 + 0.01 * i, 2) for i in range(6)]   # 0.70 .. 0.75
+
+
+def _fx_cost_ok(tv_cost, hal_total, is_canadian):
+    """Returns (cost_ok, fx_rate). For Canadian teams, tries each FX rate and
+    returns the first that ties HAL(CAD)*rate to TicketVault(USD)."""
+    if not is_canadian:
+        return _cost_ok(tv_cost, hal_total), None
+    for rate in FX_RATES:
+        if _cost_ok(tv_cost, hal_total * rate):
+            return True, rate
+    return False, None
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
@@ -422,12 +444,33 @@ def _row(cell):
     return str(cell or "").strip().upper()
 
 
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def _date_seat_pair(cell):
+    """Excel also stores date-corrupted seat ranges as TEXT like '2-Jan' or
+    'Nov-12' (its d-mmm / mmm-d display). Recover the two numbers: '2-Jan' is
+    Jan 2 -> seats {1,2}; '12-Nov' is Nov 12 -> {11,12}."""
+    s = str(cell or "").strip().lower().replace(" ", "")
+    m = re.match(r"^(\d{1,2})-([a-z]{3,9})$", s)
+    if m and m.group(2)[:3] in _MONTHS:
+        return tuple(sorted((_MONTHS[m.group(2)[:3]], int(m.group(1)))))
+    m = re.match(r"^([a-z]{3,9})-(\d{1,2})$", s)
+    if m and m.group(1)[:3] in _MONTHS:
+        return tuple(sorted((_MONTHS[m.group(1)[:3]], int(m.group(2)))))
+    return None
+
+
 def _seatnums(cell):
     # Excel silently turns seat ranges like "3-9" into a date (Mar 9). Recover
     # them as month-day -> seat range (verified against Qty in real exports).
     if isinstance(cell, (dt.datetime, dt.date)):
         lo, hi = sorted((cell.month, cell.day))
         return set(range(lo, hi + 1))
+    pair = _date_seat_pair(cell)   # text form like "2-Jan"
+    if pair:
+        return set(range(pair[0], pair[1] + 1))
     s = str(cell or "").replace(" ", "")
     if not s:
         return set()
@@ -444,10 +487,15 @@ def _seatnums(cell):
 
 
 def _seat_text(cell):
-    """Readable seat string. Excel turns ranges like '3-9' into a date (Mar 9);
-    render those back as 'month-day' so both display and matching are correct."""
+    """Readable seat string. Excel turns ranges like '3-9' into a date (Mar 9),
+    or stores them as text like '2-Jan'; render those back as 'lo-hi' so both
+    display and matching are correct."""
     if isinstance(cell, (dt.datetime, dt.date)):
-        return f"{cell.month}-{cell.day}"
+        lo, hi = sorted((cell.month, cell.day))
+        return f"{lo}-{hi}"
+    pair = _date_seat_pair(cell)
+    if pair:
+        return f"{pair[0]}-{pair[1]}"
     return str(cell or "").strip()
 
 
@@ -836,17 +884,19 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
         # Compare HAL # games against TV games WITHOUT cost instead of with cost.
         zero_parking = r["is_parking"] and r["total"] == 0
+        is_can = r["team"] in CANADIAN_TEAMS
         base = {
             "Team": r["team"], "Email": r["Email"], "Full/Partial": r["Full/Partial"],
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
             "# Games": r["games"], "HAL Total Cost": round(r["total"], 2),
             "TV Total Cost": tv_cost, "# Games w/Cost": wc, "# Games w/o Cost": woc,
-            "_parking": r["is_parking"], "_flex": r["is_flex"],
+            "_parking": r["is_parking"], "_flex": r["is_flex"], "FX Rate Used": None,
         }
 
-        def variances(tvc, games_wc, games_woc, alt_email=""):
-            dollar = round(tvc - r["total"], 2)
-            pct = round(dollar / r["total"], 4) if r["total"] else None
+        def variances(tvc, games_wc, games_woc, alt_email="", fx=None):
+            hal_adj = r["total"] * (fx if fx else 1.0)   # CAD->USD for Canadian teams
+            dollar = round(tvc - hal_adj, 2)
+            pct = round(dollar / hal_adj, 4) if hal_adj else None
             if r["is_flex"] or r["games"] is None:
                 gvar = None
             else:
@@ -860,20 +910,30 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             }
 
         # flex / ticket-bank: no seats to match — reconcile when the TicketVault
-        # spend for this email+team is at least the HAL credit.
+        # spend for this email+team is at least the HAL credit (FX-adjusted for CAD).
         if r["is_flex"]:
-            if own_matches and (tv_cost >= r["total"] or _cost_ok(tv_cost, r["total"])):
-                reconciled.append({**base, **variances(tv_cost, wc, woc)})
+            fx = None
+            if own_matches:
+                for rt in (FX_RATES if is_can else [1.0]):
+                    if tv_cost >= r["total"] * rt or _cost_ok(tv_cost, r["total"] * rt):
+                        fx = rt
+                        break
+            fx_used = (fx if is_can else None)
+            if own_matches and fx is not None:
+                reconciled.append({**base, **variances(tv_cost, wc, woc, fx=fx),
+                                   "FX Rate Used": fx_used})
             elif own_matches:
                 not_reconciled.append({**base, **variances(tv_cost, wc, woc),
-                                        "Notes": "Total Cost", "_p": 1})
+                                       "Notes": "Total Cost", "_p": 1,
+                                       "FX Rate Used": "None Worked" if is_can else None})
             else:
                 not_reconciled.append({**base, **variances(0.0, 0, 0),
-                                        "Notes": "Not Bought In", "_p": 0})
+                                       "Notes": "Not Bought In", "_p": 0})
             continue
 
         if own_matches:
-            cost_ok = _cost_ok(tv_cost, r["total"])
+            cost_ok, fx = _fx_cost_ok(tv_cost, r["total"], is_can)
+            fx_used = (fx if is_can else None)
             games_known = r["games"] is not None
             if not games_known:
                 games_ok = True   # HAL has no game count — reconcile on cost alone
@@ -882,15 +942,18 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             else:
                 games_ok = wc == r["games"]
             if cost_ok and games_ok:
-                reconciled.append({**base, **variances(tv_cost, wc, woc)})
+                reconciled.append({**base, **variances(tv_cost, wc, woc, fx=fx),
+                                   "FX Rate Used": fx_used})
                 continue
             parts = []
             if not games_ok:
                 parts.append("# Games")
             if not cost_ok:
                 parts.append("Total Cost")
-            not_reconciled.append({**base, **variances(tv_cost, wc, woc),
-                                    "Notes": ", ".join(parts), "_p": 1})
+            not_reconciled.append({**base, **variances(tv_cost, wc, woc, fx=fx),
+                                    "Notes": ", ".join(parts), "_p": 1,
+                                    "FX Rate Used": ("None Worked" if (is_can and not cost_ok)
+                                                     else fx_used)})
             continue
 
         # nothing under the account's own email — look for the same seats under a
@@ -907,18 +970,18 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                 if (x["email"] not in own and _sec_match(x["sec"], r["sec_n"])
                         and ((not hs) or (x["seatset"] & hs))):
                     by_email[x["email"]].append(x)
-            best = None   # (ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms)
+            best = None   # (ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms, fx)
             for alt_email, ms in by_email.items():
                 a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
-                cost_ok = _cost_ok(a_cost, r["total"])
+                cost_ok, fx = _fx_cost_ok(a_cost, r["total"], is_can)
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
                 cand = (cost_ok and games_ok, cost_ok, games_ok, a_cost,
-                        alt_email, a_wc, a_woc, ms)
+                        alt_email, a_wc, a_woc, ms, fx)
                 # prefer a clean tie, then the most complete (highest cost)
                 if best is None or (cand[0], cand[3]) > (best[0], best[3]):
                     best = cand
             if best is not None:
-                ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms = best
+                ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms, fx = best
                 for x in ms:      # matched under a different email
                     x["_hal"] = True
                     if r.get("_hal_tab_row"):
@@ -930,8 +993,10 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
                     notes.append("# Games")
                 if not cost_ok:
                     notes.append("Total Cost")
-                not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email),
-                                       "Notes": ", ".join(notes), "_p": 2})
+                not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email, fx=fx),
+                                       "Notes": ", ".join(notes), "_p": 2,
+                                       "FX Rate Used": ("None Worked" if (is_can and not cost_ok)
+                                                        else (fx if is_can else None))})
                 matched = True
         if not matched:
             not_reconciled.append({**base, **variances(0.0, 0, 0), "Notes": "Not Bought In", "_p": 0})
@@ -957,28 +1022,29 @@ CENTER = Alignment(horizontal="center")
 
 RECON_COLS = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
               "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
-              "Total Cost", "Total Cost"]
+              "Total Cost", "Total Cost", "FX Rate Used"]
 RECON_SRC = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
              "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
-             "Var Total Cost", "Var Total Cost %"]
-RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0, 13.0, 13.0]
+             "Var Total Cost", "Var Total Cost %", "FX Rate Used"]
+RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0, 13.0, 13.0, 13.0]
 RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12),
                ("Variances", VAR_FILL, 13, 14)]
 RECON_COST = {9, 10, 13}
-RECON_PCT = {14}
+RECON_PCT = {14, 15}
 
 NR_COLS = ["Variances", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
-           "Total Cost", "Total Cost", "# Games w/Cost", "Email Address"]
+           "Total Cost", "Total Cost", "# Games w/Cost", "Email Address", "FX Rate Used"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
           "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
-          "Var Total Cost", "Var Total Cost %", "Var # Games w/Cost", "Var Email Address"]
+          "Var Total Cost", "Var Total Cost %", "Var # Games w/Cost", "Var Email Address",
+          "FX Rate Used"]
 NR_W = [26.0, 20.0, 28.6, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 20.1, 22.0,
-        13.0, 13.0, 15.0, 30.0]
+        13.0, 13.0, 15.0, 30.0, 13.0]
 NR_BANDS = [("per HAL", HAL_FILL, 1, 10), ("per TicketVault", TV_FILL, 11, 13),
             ("Variances", VAR_FILL, 14, 17)]
 NR_COST = {10, 11, 14}
-NR_PCT = {15}
+NR_PCT = {15, 18}
 
 
 def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols, pct_cols=frozenset()):
@@ -1005,6 +1071,8 @@ def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols, pct_col
                 cell.number_format = CUR
             elif j in pct_cols:
                 cell.number_format = "0.00%"
+            elif src == "Seats":
+                cell.number_format = "@"   # text, so Excel keeps "1-2" (not a date)
     end = 2 + len(rows)
     lefts = {b[2] for b in bands}
     rights = {b[3] for b in bands}
@@ -1082,6 +1150,10 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
                     if amt is not None:
                         cell.value = amt
                         cell.number_format = CUR
+                elif isinstance(cell.value, (dt.datetime, dt.date)):
+                    cell.number_format = "m/d/yyyy"       # dates: no timestamps
+                elif seat_i is not None and (j - 1) == seat_i:
+                    cell.number_format = "@"              # seats stay text (not a date)
                 note(j, cell.value if cell.value is not None else "")
             r += 1
         if first:
