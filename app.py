@@ -257,15 +257,15 @@ def _cost_ok(tv_cost, hal_total):
 
 
 # Canadian teams bill their HAL in CAD, but TicketVault records USD at a rate
-# usually between 70% and 75%. Reconcile if ANY rate in that continuous range
-# ties HAL(CAD)*rate to TicketVault(USD) — not just whole-percent steps.
+# that can land anywhere from ~65% to 85%. Reconcile if the implied rate falls
+# in that continuous range (assuming the other data points match).
 CANADIAN_TEAMS = {
     "Toronto Blue Jays", "Toronto Raptors", "Toronto Maple Leafs",
     "Montreal Canadiens", "Ottawa Senators", "Vancouver Canucks",
     "Calgary Flames", "Edmonton Oilers", "Winnipeg Jets",
     "Toronto FC", "Vancouver Whitecaps FC", "Vancouver Whitecaps", "CF Montreal",
 }
-FX_MIN, FX_MAX = 0.70, 0.75
+FX_MIN, FX_MAX = 0.65, 0.85
 
 
 def _fx_cost_ok(tv_cost, hal_total, is_canadian):
@@ -1033,7 +1033,7 @@ RECON_SRC = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
              "Var Total Cost", "Var Total Cost %", "FX Rate Used"]
 RECON_W = [22.3, 46.3, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 22.0, 13.0, 13.0, 13.0, 13.0]
 RECON_BANDS = [("per HAL", HAL_FILL, 1, 9), ("per TicketVault", TV_FILL, 10, 12),
-               ("Variances", VAR_FILL, 13, 14)]
+               ("Variances", VAR_FILL, 13, 15)]
 RECON_COST = {9, 10, 13}
 RECON_PCT = {14, 15}
 
@@ -1172,7 +1172,7 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
         ws.column_dimensions[get_column_letter(j)].width = min(max(base, fit), 80)
 
 
-def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
+def build_workbook(company, league, year, sel_type, as_of, reconciled, not_reconciled,
                    hal_total, tolerance, hal_blocks, pv_header, pv_rows):
     t_rec = [r for r in reconciled if not r.get("_parking") and not r.get("_flex")]
     p_rec = [r for r in reconciled if r.get("_parking")]
@@ -1204,7 +1204,8 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
     info(3, f"Company:  {company}", 11, True)
     info(4, f"League:  {league}", 10, False)
     info(5, f"Year:  {year}", 10, False)
-    info(6, f"As Of:  {as_of}", 10, False)
+    info(6, f"Type:  {sel_type}", 10, False)
+    info(7, f"As Of:  {as_of}", 10, False)
 
     def bar(r, text):
         c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
@@ -1221,19 +1222,19 @@ def build_workbook(company, league, year, as_of, reconciled, not_reconciled,
         for c in (ca, cb):
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
-    bar(8, "RESULT"); hd(9, "Metric", "Count")
-    line(10, "Reconciled", len(t_rec))
-    line(11, "Not Reconciled", len(t_nr))
-    line(12, "Parking Reconciled", len(p_rec))
-    line(13, "Parking Not Reconciled", len(p_nr))
-    line(14, "Flex Reconciled", len(f_rec))
-    line(15, "Flex Not Reconciled", len(f_nr))
-    line(16, "Total # HAL Records", hal_total, bold=True)
-    bar(18, "NOT RECONCILED — BY REASON"); hd(19, "Reason", "Count")
-    line(20, "Not bought in", nbi)
-    line(21, "Different email address", de)
-    line(22, "Cost / games mismatch", mismatch)
-    line(23, "TOTAL", nr_n, bold=True)
+    bar(9, "RESULT"); hd(10, "Metric", "Count")
+    line(11, "Reconciled", len(t_rec))
+    line(12, "Not Reconciled", len(t_nr))
+    line(13, "Parking Reconciled", len(p_rec))
+    line(14, "Parking Not Reconciled", len(p_nr))
+    line(15, "Flex Reconciled", len(f_rec))
+    line(16, "Flex Not Reconciled", len(f_nr))
+    line(17, "Total # HAL Records", hal_total, bold=True)
+    bar(19, "NOT RECONCILED — BY REASON"); hd(20, "Reason", "Count")
+    line(21, "Not bought in", nbi)
+    line(22, "Different email address", de)
+    line(23, "Cost / games mismatch", mismatch)
+    line(24, "TOTAL", nr_n, bold=True)
 
     # ---- Tickets: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
@@ -1387,7 +1388,8 @@ def process():
         for company, recs in hal_by_company.items():
             vb = vault.get(company, {"primary": {}, "secondary": {}, "rows": []})
             reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
-            data, m = build_workbook(company, league, year, as_of_fmt, reconciled, not_reconciled,
+            data, m = build_workbook(company, league, year, sel_type, as_of_fmt,
+                                     reconciled, not_reconciled,
                                      len(recs), tolerance, hal_src_by_company.get(company, []),
                                      pv_header, vb["rows"])
             fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
