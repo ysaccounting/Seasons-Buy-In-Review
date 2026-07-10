@@ -257,24 +257,28 @@ def _cost_ok(tv_cost, hal_total):
 
 
 # Canadian teams bill their HAL in CAD, but TicketVault records USD at a rate
-# usually between 70% and 75%. Try each rate (1% steps) when reconciling them.
+# usually between 70% and 75%. Reconcile if ANY rate in that continuous range
+# ties HAL(CAD)*rate to TicketVault(USD) — not just whole-percent steps.
 CANADIAN_TEAMS = {
     "Toronto Blue Jays", "Toronto Raptors", "Toronto Maple Leafs",
     "Montreal Canadiens", "Ottawa Senators", "Vancouver Canucks",
     "Calgary Flames", "Edmonton Oilers", "Winnipeg Jets",
     "Toronto FC", "Vancouver Whitecaps FC", "Vancouver Whitecaps", "CF Montreal",
 }
-FX_RATES = [round(0.70 + 0.01 * i, 2) for i in range(6)]   # 0.70 .. 0.75
+FX_MIN, FX_MAX = 0.70, 0.75
 
 
 def _fx_cost_ok(tv_cost, hal_total, is_canadian):
-    """Returns (cost_ok, fx_rate). For Canadian teams, tries each FX rate and
-    returns the first that ties HAL(CAD)*rate to TicketVault(USD)."""
+    """Returns (cost_ok, fx_rate). For Canadian teams, the implied rate is
+    tv/hal; if it lands anywhere in [0.70, 0.75] (or the nearest edge ties within
+    tolerance), it reconciles at that rate."""
     if not is_canadian:
         return _cost_ok(tv_cost, hal_total), None
-    for rate in FX_RATES:
-        if _cost_ok(tv_cost, hal_total * rate):
-            return True, rate
+    if not hal_total:
+        return _cost_ok(tv_cost, 0.0), None
+    rate = min(max(tv_cost / hal_total, FX_MIN), FX_MAX)   # best rate in range
+    if _cost_ok(tv_cost, hal_total * rate):
+        return True, round(rate, 4)
     return False, None
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
@@ -912,14 +916,15 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # flex / ticket-bank: no seats to match — reconcile when the TicketVault
         # spend for this email+team is at least the HAL credit (FX-adjusted for CAD).
         if r["is_flex"]:
-            fx = None
+            fx, ok = None, False
             if own_matches:
-                for rt in (FX_RATES if is_can else [1.0]):
-                    if tv_cost >= r["total"] * rt or _cost_ok(tv_cost, r["total"] * rt):
-                        fx = rt
-                        break
+                if is_can and r["total"]:
+                    ok = tv_cost + COST_ABS_TOL >= r["total"] * FX_MIN
+                    fx = round(min(max(tv_cost / r["total"], FX_MIN), FX_MAX), 4) if ok else None
+                else:
+                    ok = tv_cost >= r["total"] or _cost_ok(tv_cost, r["total"])
             fx_used = (fx if is_can else None)
-            if own_matches and fx is not None:
+            if own_matches and ok:
                 reconciled.append({**base, **variances(tv_cost, wc, woc, fx=fx),
                                    "FX Rate Used": fx_used})
             elif own_matches:
@@ -1034,17 +1039,17 @@ RECON_PCT = {14, 15}
 
 NR_COLS = ["Variances", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
            "# Games", "Total Cost", "Total Cost", "# Games w/Cost", "# Games w/o Cost",
-           "Total Cost", "Total Cost", "# Games w/Cost", "Email Address", "FX Rate Used"]
+           "Total Cost", "Total Cost", "FX Rate Used", "# Games w/Cost", "Email Address"]
 NR_SRC = ["Notes", "Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty",
           "# Games", "HAL Total Cost", "TV Total Cost", "# Games w/Cost", "# Games w/o Cost",
-          "Var Total Cost", "Var Total Cost %", "Var # Games w/Cost", "Var Email Address",
-          "FX Rate Used"]
+          "Var Total Cost", "Var Total Cost %", "FX Rate Used", "Var # Games w/Cost",
+          "Var Email Address"]
 NR_W = [26.0, 20.0, 28.6, 15.6, 12.4, 9.6, 10.6, 8.6, 13.4, 14.6, 13.0, 20.1, 22.0,
-        13.0, 13.0, 15.0, 30.0, 13.0]
+        13.0, 13.0, 13.0, 15.0, 30.0]
 NR_BANDS = [("per HAL", HAL_FILL, 1, 10), ("per TicketVault", TV_FILL, 11, 13),
-            ("Variances", VAR_FILL, 14, 17)]
+            ("Variances", VAR_FILL, 14, 18)]
 NR_COST = {10, 11, 14}
-NR_PCT = {15, 18}
+NR_PCT = {15, 16}
 
 
 def _build_detail_tab(ws, headers, srcs, widths, rows, bands, cost_cols, pct_cols=frozenset()):
