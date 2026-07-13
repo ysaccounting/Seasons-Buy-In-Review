@@ -281,6 +281,14 @@ def _fx_cost_ok(tv_cost, hal_total, is_canadian, fx_range=None):
     if _cost_ok(tv_cost, hal_total * rate):
         return True, round(rate, 4)
     return False, None
+def _implied_fx(tv_cost, hal_total):
+    """The FX rate that WOULD make this record tie exactly (TicketVault USD /
+    HAL CAD). Shown on the not-reconciled tabs so the needed rate is visible."""
+    if not hal_total or not tv_cost:
+        return None
+    return round(tv_cost / hal_total, 4)
+
+
 LEAGUES = ["MLB", "MLS", "NBA", "NFL", "NHL", "NCAAF", "NCAAB", "WNBA", "Racing"]
 YEARS = ["2025-26", "2026-27", "2027-28", "2028-29"]
 TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
@@ -932,7 +940,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
             elif own_matches:
                 not_reconciled.append({**base, **variances(tv_cost, wc, woc),
                                        "Notes": "Total Cost", "_p": 1,
-                                       "FX Rate Used": "None Worked" if is_can else None})
+                                       "FX Rate Used": (_implied_fx(tv_cost, r["total"])
+                                                        if is_can else None)})
             else:
                 not_reconciled.append({**base, **variances(0.0, 0, 0),
                                        "Notes": "Not Bought In", "_p": 0})
@@ -959,8 +968,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
                 parts.append("Total Cost")
             not_reconciled.append({**base, **variances(tv_cost, wc, woc, fx=fx),
                                     "Notes": ", ".join(parts), "_p": 1,
-                                    "FX Rate Used": ("None Worked" if (is_can and not cost_ok)
-                                                     else fx_used)})
+                                    "FX Rate Used": (_implied_fx(tv_cost, r["total"])
+                                                     if (is_can and not cost_ok) else fx_used)})
             continue
 
         # nothing under the account's own email — look for the same seats under a
@@ -1002,7 +1011,8 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
                     notes.append("Total Cost")
                 not_reconciled.append({**alt, **variances(a_cost, a_wc, a_woc, alt_email, fx=fx),
                                        "Notes": ", ".join(notes), "_p": 2,
-                                       "FX Rate Used": ("None Worked" if (is_can and not cost_ok)
+                                       "FX Rate Used": (_implied_fx(a_cost, r["total"])
+                                                        if (is_can and not cost_ok)
                                                         else (fx if is_can else None))})
                 matched = True
         if not matched:
