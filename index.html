@@ -29,6 +29,15 @@
   .control input[type="date"]:focus { outline: none; border-color: #7B8DB0; }
   .control select.need { border-color: #E2A8A8; background: #FFF7F7; }
   .control select:focus { outline: none; border-color: #7B8DB0; }
+  .control input[type="number"] { width: 100%; font-family: inherit; font-size: .85rem; color: #111; background: #fff;
+      border: 1px solid #D6D9E0; border-radius: 6px; padding: .5rem .6rem; }
+  .control input[type="number"].need { border-color: #E2A8A8; background: #FFF7F7; }
+  .control input[type="number"]:focus { outline: none; border-color: #7B8DB0; }
+  .control input[type="number"]:disabled { background: #F1F2F5; color: #9AA0AC; cursor: not-allowed; }
+  .control.fx-na { flex: 0 0 auto; display: flex; align-items: flex-end; padding-bottom: .55rem; }
+  .fx-na label { display: flex; align-items: center; gap: .4rem; font-size: .72rem; font-weight: 600;
+      letter-spacing: 1px; text-transform: uppercase; color: #5A6172; cursor: pointer; }
+  .fx-na input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; }
   .dropzone { border: 2px dashed #C4C9D8; border-radius: 12px; background: #F8F9FC; padding: 1.4rem 1.5rem;
     text-align: center; cursor: pointer; transition: border-color .2s, background .2s; position: relative; }
   .dropzone:hover, .dropzone.drag-over { border-color: #7B8DB0; background: #F0F3FA; }
@@ -123,6 +132,22 @@
       </div>
     </div>
 
+    <div class="controls">
+      <div class="control">
+        <label>CAD FX Low (%)</label>
+        <input type="number" id="fxLow" min="1" max="200" step="0.01" placeholder="65" value="65">
+      </div>
+      <div class="control">
+        <label>CAD FX High (%)</label>
+        <input type="number" id="fxHigh" min="1" max="200" step="0.01" placeholder="85" value="85">
+      </div>
+      <div class="control fx-na">
+        <label><input type="checkbox" id="fxNa"> N/A</label>
+      </div>
+      <div class="control"></div>
+      <div class="control"></div>
+    </div>
+
     <div class="section-label">Upload HAL for one or more brokers and select from the drop-down list which broker each one is for.</div>
     <div class="dropzone" id="dzHal" data-key="hal">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
@@ -170,6 +195,9 @@
   const yearSel = document.getElementById('year');
   const typeSel = document.getElementById('type');
   const asofInput = document.getElementById('asof');
+  const fxLow = document.getElementById('fxLow');
+  const fxHigh = document.getElementById('fxHigh');
+  const fxNa = document.getElementById('fxNa');
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
   const spinner = document.getElementById('spinner');
@@ -190,6 +218,20 @@
   [leagueSel, yearSel, typeSel].forEach(s => s.addEventListener('change', () => {
     s.classList.toggle('need', !s.value); updateBtn();
   }));
+
+  function syncFx() {
+    const off = fxNa.checked;
+    fxLow.disabled = off;
+    fxHigh.disabled = off;
+    if (off) { fxLow.classList.remove('need'); fxHigh.classList.remove('need'); }
+    updateBtn();
+  }
+  fxNa.addEventListener('change', syncFx);
+  [fxLow, fxHigh].forEach(el => el.addEventListener('input', () => {
+    el.classList.toggle('need', !fxNa.checked && !el.value);
+    updateBtn();
+  }));
+  syncFx();
   asofInput.addEventListener('change', () => {
     asofInput.classList.toggle('need', !asofInput.value); updateBtn();
   });
@@ -260,6 +302,7 @@
 
   function ready() {
     if (!leagueSel.value || !yearSel.value || !typeSel.value || !asofInput.value) return false;
+    if (!fxNa.checked && (!fxLow.value || !fxHigh.value)) return false;
     if (!store.hal.length || !store.details.length) return false;
     if (store.hal.some(e => !e.company)) return false;
     return true;
@@ -293,6 +336,11 @@
     fd.append('year', yearSel.value);
     fd.append('type', typeSel.value);
     fd.append('as_of', asofInput.value);
+    fd.append('fx_na', fxNa.checked ? '1' : '0');
+    if (!fxNa.checked) {
+      fd.append('fx_low', fxLow.value);
+      fd.append('fx_high', fxHigh.value);
+    }
     store.hal.forEach(e => { fd.append('hal', e.file); fd.append('hal_company', e.company); });
     store.details.forEach(e => fd.append('details', e.file));
 

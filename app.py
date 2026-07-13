@@ -265,18 +265,19 @@ CANADIAN_TEAMS = {
     "Calgary Flames", "Edmonton Oilers", "Winnipeg Jets",
     "Toronto FC", "Vancouver Whitecaps FC", "Vancouver Whitecaps", "CF Montreal",
 }
-FX_MIN, FX_MAX = 0.65, 0.85
+FX_MIN, FX_MAX = 0.65, 0.85   # defaults; the UI can override per run (or set N/A)
 
 
-def _fx_cost_ok(tv_cost, hal_total, is_canadian):
+def _fx_cost_ok(tv_cost, hal_total, is_canadian, fx_range=None):
     """Returns (cost_ok, fx_rate). For Canadian teams, the implied rate is
-    tv/hal; if it lands anywhere in [0.70, 0.75] (or the nearest edge ties within
-    tolerance), it reconciles at that rate."""
-    if not is_canadian:
+    tv/hal; if it lands in the given range (from the UI), it reconciles at that
+    rate. fx_range of None means FX is N/A — compare CAD to USD straight."""
+    if not is_canadian or fx_range is None:
         return _cost_ok(tv_cost, hal_total), None
+    lo, hi = fx_range
     if not hal_total:
         return _cost_ok(tv_cost, 0.0), None
-    rate = min(max(tv_cost / hal_total, FX_MIN), FX_MAX)   # best rate in range
+    rate = min(max(tv_cost / hal_total, lo), hi)   # best rate in range
     if _cost_ok(tv_cost, hal_total * rate):
         return True, round(rate, 4)
     return False, None
@@ -844,7 +845,7 @@ def _games_split(matches, hal_seats=None):
     return wc, woc, round(total, 2)
 
 
-def reconcile(hal_rows, primary_index, secondary_index, tolerance):
+def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None):
     reconciled, not_reconciled = [], []
     for r in hal_rows:
         own = set(r["emails"])
@@ -888,7 +889,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
         # Compare HAL # games against TV games WITHOUT cost instead of with cost.
         zero_parking = r["is_parking"] and r["total"] == 0
-        is_can = r["team"] in CANADIAN_TEAMS
+        is_can = (r["team"] in CANADIAN_TEAMS) and (fx_range is not None)
         base = {
             "Team": r["team"], "Email": r["Email"], "Full/Partial": r["Full/Partial"],
             "Section": r["Section"], "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
@@ -919,8 +920,9 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             fx, ok = None, False
             if own_matches:
                 if is_can and r["total"]:
-                    ok = tv_cost + COST_ABS_TOL >= r["total"] * FX_MIN
-                    fx = round(min(max(tv_cost / r["total"], FX_MIN), FX_MAX), 4) if ok else None
+                    lo, hi = fx_range
+                    ok = tv_cost + COST_ABS_TOL >= r["total"] * lo
+                    fx = round(min(max(tv_cost / r["total"], lo), hi), 4) if ok else None
                 else:
                     ok = tv_cost >= r["total"] or _cost_ok(tv_cost, r["total"])
             fx_used = (fx if is_can else None)
@@ -937,7 +939,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             continue
 
         if own_matches:
-            cost_ok, fx = _fx_cost_ok(tv_cost, r["total"], is_can)
+            cost_ok, fx = _fx_cost_ok(tv_cost, r["total"], is_can, fx_range)
             fx_used = (fx if is_can else None)
             games_known = r["games"] is not None
             if not games_known:
@@ -978,7 +980,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance):
             best = None   # (ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms, fx)
             for alt_email, ms in by_email.items():
                 a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
-                cost_ok, fx = _fx_cost_ok(a_cost, r["total"], is_can)
+                cost_ok, fx = _fx_cost_ok(a_cost, r["total"], is_can, fx_range)
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
                 cand = (cost_ok and games_ok, cost_ok, games_ok, a_cost,
                         alt_email, a_wc, a_woc, ms, fx)
@@ -1172,7 +1174,7 @@ def _build_source_tab(ws, prepend_headers, prepend_widths, header, blocks, clean
         ws.column_dimensions[get_column_letter(j)].width = min(max(base, fit), 80)
 
 
-def build_workbook(company, league, year, sel_type, as_of, reconciled, not_reconciled,
+def build_workbook(company, league, year, sel_type, as_of, fx_range, reconciled, not_reconciled,
                    hal_total, tolerance, hal_blocks, pv_header, pv_rows):
     t_rec = [r for r in reconciled if not r.get("_parking") and not r.get("_flex")]
     p_rec = [r for r in reconciled if r.get("_parking")]
@@ -1205,7 +1207,12 @@ def build_workbook(company, league, year, sel_type, as_of, reconciled, not_recon
     info(4, f"League:  {league}", 10, False)
     info(5, f"Year:  {year}", 10, False)
     info(6, f"Type:  {sel_type}", 10, False)
-    info(7, f"As Of:  {as_of}", 10, False)
+    if fx_range:
+        fx_txt = f"{fx_range[0] * 100:.2f}% - {fx_range[1] * 100:.2f}%"
+    else:
+        fx_txt = "N/A"
+    info(7, f"CAD FX Range:  {fx_txt}", 10, False)
+    info(8, f"As Of:  {as_of}", 10, False)
 
     def bar(r, text):
         c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
@@ -1222,19 +1229,19 @@ def build_workbook(company, league, year, sel_type, as_of, reconciled, not_recon
         for c in (ca, cb):
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
-    bar(9, "RESULT"); hd(10, "Metric", "Count")
-    line(11, "Reconciled", len(t_rec))
-    line(12, "Not Reconciled", len(t_nr))
-    line(13, "Parking Reconciled", len(p_rec))
-    line(14, "Parking Not Reconciled", len(p_nr))
-    line(15, "Flex Reconciled", len(f_rec))
-    line(16, "Flex Not Reconciled", len(f_nr))
-    line(17, "Total # HAL Records", hal_total, bold=True)
-    bar(19, "NOT RECONCILED — BY REASON"); hd(20, "Reason", "Count")
-    line(21, "Not bought in", nbi)
-    line(22, "Different email address", de)
-    line(23, "Cost / games mismatch", mismatch)
-    line(24, "TOTAL", nr_n, bold=True)
+    bar(10, "RESULT"); hd(11, "Metric", "Count")
+    line(12, "Reconciled", len(t_rec))
+    line(13, "Not Reconciled", len(t_nr))
+    line(14, "Parking Reconciled", len(p_rec))
+    line(15, "Parking Not Reconciled", len(p_nr))
+    line(16, "Flex Reconciled", len(f_rec))
+    line(17, "Flex Not Reconciled", len(f_nr))
+    line(18, "Total # HAL Records", hal_total, bold=True)
+    bar(20, "NOT RECONCILED — BY REASON"); hd(21, "Reason", "Count")
+    line(22, "Not bought in", nbi)
+    line(23, "Different email address", de)
+    line(24, "Cost / games mismatch", mismatch)
+    line(25, "TOTAL", nr_n, bold=True)
 
     # ---- Tickets: Reconciled / Not Reconciled --------------------------- #
     _build_detail_tab(wb.create_sheet("Reconciled"), RECON_COLS, RECON_SRC, RECON_W,
@@ -1309,6 +1316,27 @@ def process():
         return jsonify({"error": "Please choose a Type."}), 400
     if not as_of:
         return jsonify({"error": "Please choose an As Of Date."}), 400
+
+    # FX conversion range for Canadian teams (HAL in CAD, TicketVault in USD).
+    # "N/A" means don't apply any conversion.
+    fx_na = (request.form.get("fx_na") or "").strip().lower() in ("1", "true", "yes", "on")
+    fx_range = None
+    if not fx_na:
+        raw_lo = (request.form.get("fx_low") or "").strip()
+        raw_hi = (request.form.get("fx_high") or "").strip()
+        if not raw_lo or not raw_hi:
+            return jsonify({"error": "Enter an FX low and high, or check N/A."}), 400
+        try:
+            lo, hi = float(raw_lo), float(raw_hi)
+        except ValueError:
+            return jsonify({"error": "FX low and high must be numbers."}), 400
+        if lo > 1 or hi > 1:      # entered as percentages (e.g. 65 and 85)
+            lo, hi = lo / 100.0, hi / 100.0
+        if lo <= 0 or hi <= 0:
+            return jsonify({"error": "FX low and high must be greater than zero."}), 400
+        if lo > hi:
+            lo, hi = hi, lo
+        fx_range = (lo, hi)
     as_of_fmt = _fmt_asof(as_of)
     if not hal_files:
         return jsonify({"error": "Please upload at least one HAL season ticket database."}), 400
@@ -1387,8 +1415,9 @@ def process():
         tot_rec = tot_nr = 0
         for company, recs in hal_by_company.items():
             vb = vault.get(company, {"primary": {}, "secondary": {}, "rows": []})
-            reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"], tolerance)
-            data, m = build_workbook(company, league, year, sel_type, as_of_fmt,
+            reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"],
+                                                  tolerance, fx_range)
+            data, m = build_workbook(company, league, year, sel_type, as_of_fmt, fx_range,
                                      reconciled, not_reconciled,
                                      len(recs), tolerance, hal_src_by_company.get(company, []),
                                      pv_header, vb["rows"])
