@@ -298,7 +298,7 @@ TYPES = ["Regular Season", "Playoffs/Postseason", "Both"]
 # whose layout differs, add its header names to the relevant list here.
 HAL_SYNONYMS = {
     "company": ["Company", "Client", "Broker", "Group"],
-    "league":  ["League", "League New", "Lg"],
+    "league":  ["League", "League New", "Lg", "Sport"],
     "year":    ["Year", "Season Year", "Yr", "Season"],
     "status":  ["Account Status", "Status", "Acct Status", "Account State"],
     "email":   ["Email", "Account Email", "Email Address", "Login Email",
@@ -584,15 +584,25 @@ COMPANY_EXCLUDE_BLANK_STATUS = {"y&s"}
 
 
 def _league_matches(hal_league, selected):
-    a = re.sub(r"[^a-z]", "", str(hal_league or "").lower())
-    b = re.sub(r"[^a-z]", "", str(selected or "").lower())
+    a = re.sub(r"[^a-z0-9]", "", str(hal_league or "").lower())
+    b = re.sub(r"[^a-z0-9]", "", str(selected or "").lower())
     if not a:
         return True   # no league on the row — don't filter it out
+    # map sport names / short codes onto the app's league codes
+    a = _LEAGUE_ALIAS.get(a, a)
     if a == b:
         return True
     if a == "ncaa" and b in ("ncaaf", "ncaab"):   # generic NCAA
         return True
     return False
+
+
+_LEAGUE_ALIAS = {
+    "football": "nfl", "baseball": "mlb", "hockey": "nhl", "soccer": "mls",
+    "cbb": "ncaab", "collegebasketball": "ncaab", "cfb": "ncaaf",
+    "collegefootball": "ncaaf", "f1": "racing", "nascar": "racing",
+    "formula1": "racing", "auto": "racing",
+}
 
 
 def _is_playoff(*vals):
