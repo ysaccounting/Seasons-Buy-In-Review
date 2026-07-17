@@ -843,19 +843,24 @@ def parse_details(rows, filename, league=""):
 # Reconciliation
 # --------------------------------------------------------------------------- #
 
-def _games_split(matches, hal_seats=None):
+def _games_split(matches, hal_seats=None, hal_qty=None):
     """Return (games_with_cost, games_without_cost, total_cost) for a set of
     matching vault rows. A game counts as 'with cost' if any matching row for
     that event carries a positive cost. When `hal_seats` is given, each row's
     cost is apportioned by the fraction of its seats that the HAL row covers —
     so a HAL block that is part of a larger TicketVault block gets only its
-    share (e.g. HAL seats 9-10 of a TV 7-10 block = half the cost)."""
+    share (e.g. HAL seats 9-10 of a TV 7-10 block = half the cost). If the HAL
+    lists only a single seat but has a Qty > 1 (a common export quirk), the Qty
+    is used for the share so the full block isn't halved."""
     ev = defaultdict(float)
     total = 0.0
     for x in matches:
         cost = x["cost"]
         if hal_seats is not None and x["seatset"]:
-            cost *= len(x["seatset"] & hal_seats) / len(x["seatset"])
+            overlap = len(x["seatset"] & hal_seats)
+            if hal_qty and hal_qty > 1 and len(hal_seats) == 1:
+                overlap = min(hal_qty, len(x["seatset"]))
+            cost *= overlap / len(x["seatset"])
         ev[x["event"]] = max(ev[x["event"]], cost)
         total += cost
     wc = sum(1 for v in ev.values() if v > 0)
@@ -872,6 +877,11 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
             vr.extend(primary_index.get((e, r["team"]), []))
 
         apportion = None
+        hal_qty = None
+        try:
+            hal_qty = int(float(str(r["Qty"]).strip())) if str(r["Qty"]).strip() else None
+        except (ValueError, TypeError):
+            hal_qty = None
         if not vr:
             own_matches = []
         elif r["is_flex"]:
@@ -903,7 +913,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
             if r.get("_hal_tab_row"):
                 x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
 
-        wc, woc, tv_cost = _games_split(own_matches, apportion)
+        wc, woc, tv_cost = _games_split(own_matches, apportion, hal_qty)
         # $0 parking: HAL carries no cost, so every game is expected at $0 in TV.
         # Compare HAL # games against TV games WITHOUT cost instead of with cost.
         zero_parking = r["is_parking"] and r["total"] == 0
@@ -998,7 +1008,7 @@ def reconcile(hal_rows, primary_index, secondary_index, tolerance, fx_range=None
                     by_email[x["email"]].append(x)
             best = None   # (ties, cost_ok, games_ok, a_cost, alt_email, a_wc, a_woc, ms, fx)
             for alt_email, ms in by_email.items():
-                a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None)
+                a_wc, a_woc, a_cost = _games_split(ms, hs if hs else None, hal_qty)
                 cost_ok, fx = _fx_cost_ok(a_cost, r["total"], is_can, fx_range)
                 games_ok = (r["games"] is None) or (a_wc == r["games"])
                 cand = (cost_ok and games_ok, cost_ok, games_ok, a_cost,
