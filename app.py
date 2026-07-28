@@ -434,8 +434,19 @@ def _team(cell):
     return str(cell or "").strip()
 
 
+def _num_cell(v):
+    """Excel stores plain numbers as floats, so a section/row typed as 420 or 7
+    comes back as 420.0 / 7.0. Render whole-number floats without the '.0' so
+    they match a Purchase Details '420' / '7'."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    return str(v if v is not None else "").strip()
+
+
 def _sec(cell):
-    return re.sub(r"\s+", " ", str(cell or "").strip().upper())
+    return re.sub(r"\s+", " ", _num_cell(cell).upper())
 
 
 def _sec_match(a, b):
@@ -454,7 +465,7 @@ def _sec_match(a, b):
 
 
 def _row(cell):
-    return str(cell or "").strip().upper()
+    return _num_cell(cell).upper()
 
 
 _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -484,6 +495,8 @@ def _seatnums(cell):
     pair = _date_seat_pair(cell)   # text form like "2-Jan"
     if pair:
         return set(range(pair[0], pair[1] + 1))
+    if isinstance(cell, float) and cell.is_integer():
+        cell = int(cell)
     s = str(cell or "").replace(" ", "")
     if not s:
         return set()
@@ -509,7 +522,7 @@ def _seat_text(cell):
     pair = _date_seat_pair(cell)
     if pair:
         return f"{pair[0]}-{pair[1]}"
-    return str(cell or "").strip()
+    return _num_cell(cell)
 
 
 _PARK_RE = re.compile(r"\b(parking|garage|lot|prkg|pkg)\b", re.I)
