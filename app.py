@@ -227,10 +227,16 @@ def _normalize_team(name, league):
     if not raw:
         return ""
     idx = TEAM_INDEX.get(league, {})
-    # try the name as-is, then progressively strip trailing qualifiers like
-    # " - New", " (New)", " - Renewal" — accepting a stripped form only if it
-    # resolves to a real team, so we never mangle a genuine name.
-    candidates, s = [raw.lower()], raw
+    # some brokers append "parking" to the team name (e.g. "Bengals Parking");
+    # TicketVault performers usually don't, so drop it before resolving.
+    noprk = re.sub(r"[\s\-]*parking\s*$", "", raw, flags=re.I).strip()
+    parked = bool(noprk) and noprk.lower() != raw.lower()
+    candidates = [raw.lower()]
+    if parked:
+        candidates.append(noprk.lower())
+    # then progressively strip trailing qualifiers like " - New", " (New)",
+    # " - Renewal" — accepting a stripped form only if it resolves to a team.
+    s = noprk if parked else raw
     for _ in range(3):
         m = re.sub(r"\s*(?:-\s*[^-()]+|\([^()]*\))\s*$", "", s).strip()
         if m == s or not m:
@@ -240,7 +246,25 @@ def _normalize_team(name, league):
     for cand in candidates:
         if cand in idx:
             return idx[cand]
-    return raw
+    # last resort: try the final word as a nickname ("NY Jets" -> jets, "New
+    # Orlean Saints" -> saints), plus a few common short forms.
+    base = (noprk if parked else raw).lower()
+    base = _TEAM_SHORT.get(base, base)
+    if base in idx:
+        return idx[base]
+    words = base.split()
+    if words:
+        last = _TEAM_SHORT.get(words[-1], words[-1])
+        if last in idx:
+            return idx[last]
+    return noprk if parked else raw
+
+
+_TEAM_SHORT = {
+    "bucs": "buccaneers", "niners": "49ers", "cards": "cardinals",
+    "jags": "jaguars", "pats": "patriots", "skins": "commanders",
+    "d-backs": "diamondbacks", "dbacks": "diamondbacks", "nats": "nationals",
+}
 
 DEFAULT_TOLERANCE = 5.00  # kept for the /process tolerance field (unused by _cost_ok)
 
@@ -436,13 +460,18 @@ def _team(cell):
 
 def _num_cell(v):
     """Excel stores plain numbers as floats, so a section/row typed as 420 or 7
-    comes back as 420.0 / 7.0. Render whole-number floats without the '.0' so
-    they match a Purchase Details '420' / '7'."""
+    comes back as 420.0 / 7.0; Google Sheets exports often store the same value
+    as the TEXT '420.0'. Render whole numbers without the '.0' either way so they
+    match a Purchase Details '420' / '7'."""
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
     if isinstance(v, int):
         return str(v)
-    return str(v if v is not None else "").strip()
+    s = str(v if v is not None else "").strip()
+    m = re.match(r"^(\d+)\.0+$", s)   # numeric string like "420.0" / "7.00"
+    if m:
+        return m.group(1)
+    return s
 
 
 def _sec(cell):
@@ -735,7 +764,9 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
         if widx is not None:
             where_checks.append((colname, widx, {v.lower() for v in badvals}))
     for idx, row in enumerate(data_rows):
-        team = _normalize_team(_cell(row, ci["team"]), league)
+        team_raw = _cell(row, ci["team"])
+        team = _normalize_team(team_raw, league)
+        team_parking = "parking" in str(team_raw or "").lower()
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
             annotations.append((False, "No team or email"))
@@ -781,7 +812,7 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
             continue
         games = _amount(_cell(row, ci["games"]))
         seats = _seat_text(_cell(row, ci["seats"]))
-        is_parking = _is_parking_hal(fp, section, row_v)
+        is_parking = team_parking or _is_parking_hal(fp, section, row_v)
         is_flex = (not is_parking) and _is_flex_hal(fp, section, row_v, seats)
         # no seat location at all (blank section, row and seats) — typically a
         # deposit/waitlist placeholder; omit unless it's parking or flex.
