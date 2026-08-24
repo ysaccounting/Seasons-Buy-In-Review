@@ -1361,6 +1361,357 @@ def build_workbook(company, league, year, sel_type, as_of, fx_range, reconciled,
 # Routes
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Playoffs / postseason reconciliation
+#
+# Playoff HALs are laid out per round: each round has a per-seat price (PS), a
+# games-per-round count, and a round total, where
+#     round total = PS x games x QTY
+# TicketVault records one row per game, so rounds are recovered by sorting the
+# distinct event dates for a team and slicing them by the league's round sizes
+# (MLB: 3 WC, 3 DS, 4 CS, 4 WS = 14 potential home dates). A record reconciles
+# when EVERY round ties on both cost and game count. The HAL "Fee" is excluded
+# — TicketVault never carries it.
+# --------------------------------------------------------------------------- #
+
+# Potential HOME games per round, by league. Used to slice event dates into
+# rounds; falls back to the largest games-per-round seen in the HAL itself.
+PLAYOFF_ROUNDS = {
+    "MLB": [("WC", 3), ("DS", 3), ("CS", 4), ("WS", 4)],
+    # NBA opens with a play-in (one or two home games) before the four rounds.
+    "NBA": [("PI", 2), ("R1", 4), ("R2", 4), ("CF", 4), ("F", 4)],
+    "NHL": [("R1", 4), ("R2", 4), ("CF", 4), ("F", 4)],
+    "WNBA": [("R1", 2), ("SF", 3), ("F", 3)],
+    # NFL: the Super Bowl is at a neutral site, so it is not a home game.
+    "NFL": [("WC", 1), ("DIV", 1), ("CONF", 1)],
+    "MLS": [("R1", 2), ("CSF", 1), ("CF", 1), ("F", 1)],
+}
+
+
+def _playoff_cols(header, round_code):
+    """Find this round's (per-seat, total, games) columns. Headers look like
+    'WC PS (MLB)', 'WC Total (MLB)', 'GAMES/RD WC (MLB)'; one games column can
+    cover several rounds ('GAMES/RD CS, WS (MLB)')."""
+    rc = round_code.lower()
+    def has_round(h):
+        return re.search(r"(?<![a-z0-9])" + re.escape(rc) + r"(?![a-z0-9])", h) is not None
+    ps = tot = gms = None
+    for i, h in enumerate(header):
+        if not has_round(h):
+            continue
+        if "games" in h and gms is None:
+            gms = i
+        elif re.search(r"(?<![a-z])ps(?![a-z])", h) and ps is None:
+            ps = i
+        elif "total" in h and tot is None:
+            tot = i
+    return ps, tot, gms
+
+
+def _round_names(header, league):
+    """Round codes for this league, keeping only those present in the HAL."""
+    table = PLAYOFF_ROUNDS.get(str(league).upper())
+    if table:
+        keep = [(c, n) for c, n in table if _playoff_cols(header, c)[1] is not None]
+        if keep:
+            return keep
+    # unknown league: recover round codes from the '<CODE> PS' columns
+    found = []
+    for h in header:
+        m = re.match(r"^([a-z0-9]{1,4})\s+ps\b", h)
+        if m and m.group(1) not in [c for c, _ in found]:
+            found.append((m.group(1).upper(), 4))
+    return found
+
+
+def parse_hal_playoffs(rows, filename, company, year="", league=""):
+    """Parse a playoff HAL. Returns (records, excluded, annotations)."""
+    hidx, header = _find_header_row(rows)
+    data_rows = rows[hidx + 1:]
+    ci = {k: _col_index(header, *v) for k, v in HAL_SYNONYMS.items()}
+    for key, names in (("section", ["SEC (P)", "Sec (P)", "Section (P)"]),
+                       ("row", ["ROW (P)", "Row (P)"]),
+                       ("seats", ["SEATS (P)", "Seats (P)"]),
+                       ("qty", ["QTY (P)", "Qty (P)", "Quantity (P)"])):
+        found = _col_index(header, *names)
+        if found is not None:
+            ci[key] = found
+    if ci["email"] is None:
+        ci["email"] = _sniff_email_col(header, data_rows)
+    if ci["email"] is None or ci["team"] is None:
+        raise ValueError(f"{os.path.basename(filename)}: couldn't find an email or "
+                         f"team column in the playoff HAL.")
+    if ci["status"] is None:
+        ci["status"] = _col_index(header, *_year_status_cols(year))
+    if ci["status"] is None:
+        ci["status"] = next((i for i, h in enumerate(header) if "status" in h), None)
+
+    rounds = _round_names(header, league)
+    rcols = {code: _playoff_cols(header, code) for code, _ in rounds}
+    exclude_blank_status = str(company).strip().lower() in COMPANY_EXCLUDE_BLANK_STATUS
+
+    out, excluded, annotations = [], 0, []
+    for idx, row in enumerate(data_rows):
+        team_raw = _cell(row, ci["team"])
+        team = _normalize_team(team_raw, league)
+        emails = _emails(_cell(row, ci["email"]))
+        if not team or not emails:
+            annotations.append((False, "No team or email"))
+            continue
+        if ci["league"] is not None and not _league_matches(_cell(row, ci["league"]), league):
+            annotations.append((False, f"Not {league}"))
+            continue
+        status = str(_cell(row, ci["status"]) or "").strip()
+        if exclude_blank_status and ci["status"] is not None and not status:
+            excluded += 1
+            annotations.append((False, "Status: (blank)"))
+            continue
+        if _is_nonactive(status):
+            excluded += 1
+            annotations.append((False, f"Status: {status}"))
+            continue
+        qty = _amount(_cell(row, ci["qty"])) or 0
+        per_round = {}
+        for code, _ in rounds:
+            ps_i, tot_i, gm_i = rcols[code]
+            per_round[code] = {
+                "ps": (_amount(_cell(row, ps_i)) or 0.0) if ps_i is not None else 0.0,
+                "total": (_amount(_cell(row, tot_i)) or 0.0) if tot_i is not None else 0.0,
+                "games": int(_amount(_cell(row, gm_i)) or 0) if gm_i is not None else 0,
+            }
+        section = str(_num_cell(_cell(row, ci["section"]))).strip()
+        row_v = str(_num_cell(_cell(row, ci["row"]))).strip()
+        seats = _seat_text(_cell(row, ci["seats"]))
+        out.append({
+            "company": company, "emails": emails, "team": team,
+            "Section": section, "Row": row_v, "Seats": seats,
+            "Qty": _num_cell(_cell(row, ci["qty"])),
+            "Email": str(_cell(row, ci["email"]) or "").strip(),
+            "qty_n": int(qty), "rounds": per_round,
+            "total": round(sum(v["total"] for v in per_round.values()), 2),
+            "sec_n": _sec(_cell(row, ci["section"])),
+            "row_n": _row(_cell(row, ci["row"])),
+            "is_parking": _is_parking_hal("", section, row_v),
+            "_data_idx": idx,
+        })
+        annotations.append((True, ""))
+    return out, excluded, annotations
+
+
+def _round_dates(pv_rows, rounds):
+    """Map each team's distinct event dates onto rounds, in date order."""
+    by_team = defaultdict(set)
+    for x in pv_rows:
+        d = str(x.get("event") or "")[:10]
+        if d:
+            by_team[x["team"]].add(d)
+    out = {}
+    for team, dates in by_team.items():
+        sd = sorted(dates)
+        pos, mapping = 0, {}
+        for code, size in rounds:
+            mapping[code] = set(sd[pos:pos + size])
+            pos += size
+        if pos < len(sd) and rounds:          # extra dates land in the last round
+            mapping[rounds[-1][0]] |= set(sd[pos:])
+        out[team] = mapping
+    return out
+
+
+def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
+    """Per-round cost AND game-count comparison. Returns (reconciled, not_reconciled)."""
+    reconciled, not_reconciled = [], []
+    codes = [c for c, _ in rounds]
+    for r in hal_rows:
+        own = set(r["emails"])
+        vr = []
+        for em in own:
+            vr.extend(primary_index.get((em, r["team"]), []))
+        hs = _seatnums(r["Seats"])
+        matches = [x for x in vr if _sec_match(x["sec"], r["sec_n"])
+                   and x["row"] == r["row_n"]
+                   and ((not hs) or (not x["seatset"]) or (x["seatset"] & hs))]
+        for x in matches:
+            x["_hal"] = True
+            if r.get("_hal_tab_row"):
+                x.setdefault("_hal_rows", set()).add(r["_hal_tab_row"])
+
+        dmap = round_dates.get(r["team"], {})
+        tv = {}
+        for code in codes:
+            dates = dmap.get(code, set())
+            tot, games = 0.0, set()
+            for x in matches:
+                if str(x.get("event") or "")[:10] not in dates:
+                    continue
+                cost = x["cost"]
+                if hs and x["seatset"]:
+                    share = len(x["seatset"] & hs)
+                    if r["qty_n"] > 1 and len(hs) == 1:
+                        share = min(r["qty_n"], len(x["seatset"]))
+                    cost *= share / len(x["seatset"])
+                tot += cost
+                if cost > 0:
+                    games.add(str(x.get("event"))[:10])
+            tv[code] = {"total": round(tot, 2), "games": len(games)}
+
+        base = {"Team": r["team"], "Email": r["Email"], "Section": r["Section"],
+                "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"]}
+        for code in codes:
+            base[f"HAL {code} Games"] = r["rounds"][code]["games"]
+            base[f"HAL {code} Cost"] = round(r["rounds"][code]["total"], 2)
+            base[f"TV {code} Games"] = tv[code]["games"]
+            base[f"TV {code} Cost"] = tv[code]["total"]
+        tv_total = round(sum(tv[c]["total"] for c in codes), 2)
+        base["HAL Total Cost"] = r["total"]
+        base["TV Total Cost"] = tv_total
+        base["Var Total Cost"] = round(tv_total - r["total"], 2)
+        base["Var Total Cost %"] = (round((tv_total - r["total"]) / r["total"], 4)
+                                    if r["total"] else None)
+
+        if not matches:
+            not_reconciled.append({**base, "Notes": "Not Bought In",
+                                   "Rounds Not Tying": ""})
+            continue
+        bad = []
+        for code in codes:
+            cost_ok = _cost_ok(tv[code]["total"], r["rounds"][code]["total"])
+            games_ok = tv[code]["games"] == r["rounds"][code]["games"]
+            if not (cost_ok and games_ok):
+                what = []
+                if not games_ok:
+                    what.append("# Games")
+                if not cost_ok:
+                    what.append("Total Cost")
+                bad.append(f"{code} ({', '.join(what)})")
+        if bad:
+            labels = []
+            if any("# Games" in b for b in bad):
+                labels.append("# Games")
+            if any("Total Cost" in b for b in bad):
+                labels.append("Total Cost")
+            not_reconciled.append({**base, "Notes": ", ".join(labels),
+                                   "Rounds Not Tying": "; ".join(bad)})
+        else:
+            reconciled.append({**base, "Rounds Not Tying": ""})
+    reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
+    not_reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
+    return reconciled, not_reconciled
+
+
+def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
+                           reconciled, not_reconciled, hal_total,
+                           hal_blocks, pv_header, pv_rows):
+    """Playoff workbook — same shape as the regular-season one, with a
+    per-HAL / per-TicketVault column pair for every round."""
+    codes = [c for c, _ in rounds]
+    wb = Workbook()
+
+    lead_r = ["Team", "Email", "Section", "Row", "Seats", "Qty"]
+    lead_n = ["Variances"] + lead_r
+    hal_cols, hal_src = [], []
+    tv_cols, tv_src = [], []
+    for code in codes:
+        hal_cols += [f"{code} # Games", f"{code} Total Cost"]
+        hal_src += [f"HAL {code} Games", f"HAL {code} Cost"]
+        tv_cols += [f"{code} # Games", f"{code} Total Cost"]
+        tv_src += [f"TV {code} Games", f"TV {code} Cost"]
+    hal_cols += ["Total Cost"]; hal_src += ["HAL Total Cost"]
+    tv_cols += ["Total Cost"]; tv_src += ["TV Total Cost"]
+    var_cols = ["Total Cost", "Total Cost %", "Rounds Not Tying"]
+    var_src = ["Var Total Cost", "Var Total Cost %", "Rounds Not Tying"]
+
+    def layout(lead):
+        cols = lead + hal_cols + tv_cols + var_cols
+        src = (lead if lead[0] != "Variances" else ["Notes"] + lead[1:]) + \
+              hal_src + tv_src + var_src
+        n0 = len(lead)
+        bands = [("per HAL", HAL_FILL, n0 + 1, n0 + len(hal_cols)),
+                 ("per TicketVault", TV_FILL, n0 + len(hal_cols) + 1,
+                  n0 + len(hal_cols) + len(tv_cols)),
+                 ("Variances", VAR_FILL, n0 + len(hal_cols) + len(tv_cols) + 1,
+                  n0 + len(hal_cols) + len(tv_cols) + len(var_cols))]
+        cost = {n0 + 2 * i + 2 for i in range(len(codes))}
+        cost.add(n0 + len(hal_cols))
+        off = n0 + len(hal_cols)
+        cost |= {off + 2 * i + 2 for i in range(len(codes))}
+        cost.add(off + len(tv_cols))
+        cost.add(off + len(tv_cols) + 1)
+        pct = {off + len(tv_cols) + 2}
+        widths = [22 if c in ("Team", "Email") else 13 for c in cols]
+        if lead[0] == "Variances":
+            widths[0] = 22
+        widths[len(lead) - 1] = 10
+        widths[-1] = 34
+        for i, c in enumerate(cols):
+            if c == "Email":
+                widths[i] = 34
+        return cols, src, widths, bands, cost, pct
+
+    r_cols, r_src, r_w, r_bands, r_cost, r_pct = layout(lead_r)
+    n_cols, n_src, n_w, n_bands, n_cost, n_pct = layout(lead_n)
+
+    ws = wb.active; ws.title = "Summary"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 34; ws.column_dimensions["B"].width = 16
+    t = ws.cell(1, 1, "Seasons Review — Playoffs")
+    t.font = Font(name=ARIAL, size=14, bold=True); t.alignment = CENTER
+    ws.merge_cells("A1:B1")
+
+    def info(r, text, size, bold):
+        c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=size, bold=bold)
+        c.alignment = CENTER; ws.merge_cells(f"A{r}:B{r}")
+
+    info(3, f"Company:  {company}", 11, True)
+    info(4, f"League:  {league}", 10, False)
+    info(5, f"Year:  {year}", 10, False)
+    info(6, f"Type:  {sel_type}", 10, False)
+    info(7, f"Rounds:  {', '.join(codes)}", 10, False)
+    info(8, f"As Of:  {as_of}", 10, False)
+
+    def bar(r, text):
+        c = ws.cell(r, 1, text); c.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=BLUE); c.alignment = CENTER
+        ws.cell(r, 2).fill = PatternFill("solid", fgColor=BLUE)
+
+    def hd(r, a, b):
+        for col, val in ((1, a), (2, b)):
+            c = ws.cell(r, col, val); c.font = Font(name=ARIAL, size=10, bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor=NAVY); c.alignment = CENTER
+
+    def line(r, a, b, bold=False):
+        for c in (ws.cell(r, 1, a), ws.cell(r, 2, b)):
+            c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
+
+    nbi = sum(1 for x in not_reconciled if x["Notes"] == "Not Bought In")
+    bar(10, "RESULT"); hd(11, "Metric", "Count")
+    line(12, "Reconciled", len(reconciled))
+    line(13, "Not Reconciled", len(not_reconciled))
+    line(14, "Total # HAL Records", hal_total, bold=True)
+    bar(16, "NOT RECONCILED — BY REASON"); hd(17, "Reason", "Count")
+    line(18, "Not bought in", nbi)
+    line(19, "Round cost / games mismatch", len(not_reconciled) - nbi)
+    line(20, "TOTAL", len(not_reconciled), bold=True)
+
+    _build_detail_tab(wb.create_sheet("Reconciled"), r_cols, r_src, r_w,
+                      reconciled, r_bands, r_cost, r_pct)
+    _build_detail_tab(wb.create_sheet("Not Reconciled"), n_cols, n_src, n_w,
+                      not_reconciled, n_bands, n_cost, n_pct)
+    _build_source_tab(wb.create_sheet("HAL"),
+                      ["Included in Rec?", "Reason not Included"], [16, 32],
+                      hal_blocks[0][0] if hal_blocks else [], hal_blocks, clean_seats=True)
+    pv_block = [(("Yes" if x.get("_hal") else "No",
+                  ", ".join(str(n) for n in sorted(x.get("_hal_rows", ())))), x["raw"])
+                for x in pv_rows]
+    _build_source_tab(wb.create_sheet("Purchase Details"),
+                      ["HAL Record?", "HAL Row #"], [14, 12], pv_header,
+                      [(pv_header, pv_block)])
+
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
+    return bio.read(), {"reconciled": len(reconciled), "not_reconciled": len(not_reconciled),
+                        "not_bought_in": nbi, "clean": len(not_reconciled) == 0}
+
+
 @app.route("/")
 def index():
     return send_from_directory(BASE_DIR, "index.html")
@@ -1431,13 +1782,19 @@ def process():
         hal_by_company = OrderedDict()
         hal_src_by_company = {}
         hal_next_start = {}   # company -> Excel row where the next block's header goes
+        is_playoffs = (sel_type == "Playoffs/Postseason")
         excluded_total = 0
         for i, f in enumerate(hal_files):
             company = (hal_companies[i] if i < len(hal_companies) else "").strip()
             if not company:
                 return jsonify({"error": f"Choose a company for “{f.filename}”."}), 400
             raw = _rows_from_upload(f.filename, f.read())
-            recs, excluded, annotations = parse_hal(raw, f.filename, company, year, league, sel_type)
+            if is_playoffs:
+                recs, excluded, annotations = parse_hal_playoffs(
+                    raw, f.filename, company, year, league)
+            else:
+                recs, excluded, annotations = parse_hal(
+                    raw, f.filename, company, year, league, sel_type)
             hidx, _ = _find_header_row(raw)
             hdr = raw[hidx] if hidx < len(raw) else []
             data = raw[hidx + 1:]
@@ -1487,16 +1844,32 @@ def process():
 
         reports = []
         tot_rec = tot_nr = 0
+        rounds = []
+        if is_playoffs:
+            first_hdr = next((blocks[0][0] for blocks in hal_src_by_company.values()
+                              if blocks), [])
+            rounds = _round_names([_norm_header(c) for c in first_hdr], league)
         for company, recs in hal_by_company.items():
             vb = vault.get(company, {"primary": {}, "secondary": {}, "rows": []})
-            reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"],
-                                                  tolerance, fx_range)
-            data, m = build_workbook(company, league, year, sel_type, as_of_fmt, fx_range,
-                                     reconciled, not_reconciled,
-                                     len(recs), tolerance, hal_src_by_company.get(company, []),
-                                     pv_header, vb["rows"])
-            fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
-                     f"{_safe_name(year)} - As Of {_safe_name(as_of_fmt)}.xlsx")
+            if is_playoffs:
+                rdates = _round_dates(vb["rows"], rounds)
+                reconciled, not_reconciled = reconcile_playoffs(
+                    recs, vb["primary"], rounds, rdates)
+                data, m = build_playoff_workbook(
+                    company, league, year, sel_type, as_of_fmt, rounds,
+                    reconciled, not_reconciled, len(recs),
+                    hal_src_by_company.get(company, []), pv_header, vb["rows"])
+                fname = (f"Playoffs Review - {_safe_name(company)} - {_safe_name(league)} - "
+                         f"{_safe_name(year)} - As Of {_safe_name(as_of_fmt)}.xlsx")
+            else:
+                reconciled, not_reconciled = reconcile(recs, vb["primary"], vb["secondary"],
+                                                       tolerance, fx_range)
+                data, m = build_workbook(company, league, year, sel_type, as_of_fmt, fx_range,
+                                         reconciled, not_reconciled,
+                                         len(recs), tolerance, hal_src_by_company.get(company, []),
+                                         pv_header, vb["rows"])
+                fname = (f"Seasons Review - {_safe_name(company)} - {_safe_name(league)} - "
+                         f"{_safe_name(year)} - As Of {_safe_name(as_of_fmt)}.xlsx")
             with open(os.path.join(folder, fname), "wb") as fh:
                 fh.write(data)
             tot_rec += m["reconciled"]
