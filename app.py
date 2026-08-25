@@ -1484,6 +1484,7 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
         seats = _seat_text(_cell(row, ci["seats"]))
         out.append({
             "company": company, "emails": emails, "team": team,
+            "Full/Partial": str(_cell(row, ci["fp"]) or "").strip(),
             "Section": section, "Row": row_v, "Seats": seats,
             "Qty": _num_cell(_cell(row, ci["qty"])),
             "Email": str(_cell(row, ci["email"]) or "").strip(),
@@ -1555,7 +1556,8 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
                     games.add(str(x.get("event"))[:10])
             tv[code] = {"total": round(tot, 2), "games": len(games)}
 
-        base = {"Team": r["team"], "Email": r["Email"], "Section": r["Section"],
+        base = {"Team": r["team"], "Email": r["Email"],
+                "Full/Partial": r.get("Full/Partial", ""), "Section": r["Section"],
                 "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"]}
         for code in codes:
             base[f"HAL {code} Games"] = r["rounds"][code]["games"]
@@ -1607,7 +1609,7 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
     codes = [c for c, _ in rounds]
     wb = Workbook()
 
-    lead_r = ["Team", "Email", "Section", "Row", "Seats", "Qty"]
+    lead_r = ["Team", "Email", "Full/Partial", "Section", "Row", "Seats", "Qty"]
     lead_n = ["Variances"] + lead_r
     hal_cols, hal_src = [], []
     tv_cols, tv_src = [], []
