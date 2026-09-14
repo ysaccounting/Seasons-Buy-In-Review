@@ -1571,9 +1571,15 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=No
         tv_total = round(sum(tv[c]["total"] for c in codes), 2)
         is_can = (r["team"] in CANADIAN_TEAMS) and (fx_range is not None)
         fx = None
-        if is_can and r["total"]:
-            lo, hi = fx_range
-            fx = min(max(tv_total / r["total"], lo), hi)
+        if is_can:
+            # Derive the rate only from rounds that were actually purchased — a
+            # round the account never bought (e.g. the team was eliminated) would
+            # otherwise drag the implied rate down and break every other round.
+            hal_p = sum(r["rounds"][c]["total"] for c in codes if tv[c]["total"] > 0)
+            tv_p = sum(tv[c]["total"] for c in codes if tv[c]["total"] > 0)
+            if hal_p and tv_p:
+                lo, hi = fx_range
+                fx = min(max(tv_p / hal_p, lo), hi)
 
         base = {"Team": r["team"], "Email": r["Email"],
                 "Full/Partial": r.get("Full/Partial", ""), "Section": r["Section"],
@@ -1618,7 +1624,8 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=No
                 labels.append("Total Cost")
             not_reconciled.append({
                 **base, "Notes": ", ".join(labels), "Rounds Not Tying": "; ".join(bad),
-                "FX Rate Used": (_implied_fx(tv_total, r["total"]) if is_can else None)})
+                "FX Rate Used": (round(fx, 4) if fx else
+                                 (_implied_fx(tv_total, r["total"]) if is_can else None))})
         else:
             reconciled.append({**base, "Rounds Not Tying": ""})
     reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
