@@ -1472,6 +1472,16 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
             annotations.append((False, f"Status: {status}"))
             continue
         qty = _amount(_cell(row, ci["qty"])) or 0
+        # Rows with nothing filled in across the round columns (no formulas) are
+        # not part of the rec unless the account is Active — an Active account is
+        # still expected to buy in, so it stays and shows as not reconciled.
+        round_cells = [rcols[c][i] for c, _ in rounds for i in (0, 1)
+                       if rcols[c][i] is not None]
+        if round_cells and all(_cell(row, i) in (None, "") for i in round_cells) \
+                and "active" not in status.lower():
+            excluded += 1
+            annotations.append((False, "No playoff pricing"))
+            continue
         per_round = {}
         for code, potential in rounds:
             ps_i, tot_i, gm_i = rcols[code]
