@@ -1389,9 +1389,10 @@ PLAYOFF_ROUNDS = {
 
 
 def _playoff_cols(header, round_code):
-    """Find this round's (per-seat, total, games) columns. Headers look like
-    'WC PS (MLB)', 'WC Total (MLB)', 'GAMES/RD WC (MLB)'; one games column can
-    cover several rounds ('GAMES/RD CS, WS (MLB)')."""
+    """Find this round's (per-seat, total, games) columns. Headers vary by
+    broker: 'WC PS (MLB)' / 'WC Total (MLB)' / 'GAMES/RD WC (MLB)', or
+    'Per Play In / WC' / 'TOTAL Play In / WC' with no games column at all.
+    One games column can cover several rounds ('GAMES/RD CS, WS (MLB)')."""
     rc = round_code.lower()
     def has_round(h):
         return re.search(r"(?<![a-z0-9])" + re.escape(rc) + r"(?![a-z0-9])", h) is not None
@@ -1401,7 +1402,7 @@ def _playoff_cols(header, round_code):
             continue
         if "games" in h and gms is None:
             gms = i
-        elif re.search(r"(?<![a-z])ps(?![a-z])", h) and ps is None:
+        elif re.search(r"(?<![a-z])(?:ps|per)(?![a-z])", h) and "total" not in h and ps is None:
             ps = i
         elif "total" in h and tot is None:
             tot = i
@@ -1474,11 +1475,14 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
         per_round = {}
         for code, _ in rounds:
             ps_i, tot_i, gm_i = rcols[code]
-            per_round[code] = {
-                "ps": (_amount(_cell(row, ps_i)) or 0.0) if ps_i is not None else 0.0,
-                "total": (_amount(_cell(row, tot_i)) or 0.0) if tot_i is not None else 0.0,
-                "games": int(_amount(_cell(row, gm_i)) or 0) if gm_i is not None else 0,
-            }
+            ps = (_amount(_cell(row, ps_i)) or 0.0) if ps_i is not None else 0.0
+            tot = (_amount(_cell(row, tot_i)) or 0.0) if tot_i is not None else 0.0
+            if gm_i is not None:
+                games = int(_amount(_cell(row, gm_i)) or 0)
+            else:
+                # no games column — infer it: total / (per seat x qty)
+                games = int(round(tot / (ps * qty))) if (ps and qty and tot) else 0
+            per_round[code] = {"ps": ps, "total": tot, "games": games}
         section = str(_num_cell(_cell(row, ci["section"]))).strip()
         row_v = str(_num_cell(_cell(row, ci["row"]))).strip()
         seats = _seat_text(_cell(row, ci["seats"]))
