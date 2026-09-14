@@ -1473,15 +1473,19 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
             continue
         qty = _amount(_cell(row, ci["qty"])) or 0
         per_round = {}
-        for code, _ in rounds:
+        for code, potential in rounds:
             ps_i, tot_i, gm_i = rcols[code]
             ps = (_amount(_cell(row, ps_i)) or 0.0) if ps_i is not None else 0.0
             tot = (_amount(_cell(row, tot_i)) or 0.0) if tot_i is not None else 0.0
             if gm_i is not None:
                 games = int(_amount(_cell(row, gm_i)) or 0)
-            else:
+            elif ps and qty and tot:
                 # no games column — infer it: total / (per seat x qty)
-                games = int(round(tot / (ps * qty))) if (ps and qty and tot) else 0
+                games = int(round(tot / (ps * qty)))
+            else:
+                # zero-cost round (e.g. $0 parking): the games are still expected,
+                # so fall back to the league's potential home games for the round.
+                games = potential
             per_round[code] = {"ps": ps, "total": tot, "games": games}
         section = str(_num_cell(_cell(row, ci["section"]))).strip()
         row_v = str(_num_cell(_cell(row, ci["row"]))).strip()
@@ -1523,8 +1527,10 @@ def _round_dates(pv_rows, rounds):
     return out
 
 
-def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
-    """Per-round cost AND game-count comparison. Returns (reconciled, not_reconciled)."""
+def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=None):
+    """Per-round cost AND game-count comparison. Returns (reconciled, not_reconciled).
+    Canadian teams bill in CAD: one FX rate (implied by the grand total, clamped
+    to the UI range) is applied to every round so the rate stays consistent."""
     reconciled, not_reconciled = [], []
     codes = [c for c, _ in rounds]
     for r in hal_rows:
@@ -1545,9 +1551,10 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
         tv = {}
         for code in codes:
             dates = dmap.get(code, set())
-            tot, games = 0.0, set()
+            tot, paid, seen = 0.0, set(), set()
             for x in matches:
-                if str(x.get("event") or "")[:10] not in dates:
+                d = str(x.get("event") or "")[:10]
+                if d not in dates:
                     continue
                 cost = x["cost"]
                 if hs and x["seatset"]:
@@ -1556,9 +1563,17 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
                         share = min(r["qty_n"], len(x["seatset"]))
                     cost *= share / len(x["seatset"])
                 tot += cost
+                seen.add(d)
                 if cost > 0:
-                    games.add(str(x.get("event"))[:10])
-            tv[code] = {"total": round(tot, 2), "games": len(games)}
+                    paid.add(d)
+            tv[code] = {"total": round(tot, 2), "games": len(paid), "present": len(seen)}
+
+        tv_total = round(sum(tv[c]["total"] for c in codes), 2)
+        is_can = (r["team"] in CANADIAN_TEAMS) and (fx_range is not None)
+        fx = None
+        if is_can and r["total"]:
+            lo, hi = fx_range
+            fx = min(max(tv_total / r["total"], lo), hi)
 
         base = {"Team": r["team"], "Email": r["Email"],
                 "Full/Partial": r.get("Full/Partial", ""), "Section": r["Section"],
@@ -1568,21 +1583,26 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
             base[f"HAL {code} Cost"] = round(r["rounds"][code]["total"], 2)
             base[f"TV {code} Games"] = tv[code]["games"]
             base[f"TV {code} Cost"] = tv[code]["total"]
-        tv_total = round(sum(tv[c]["total"] for c in codes), 2)
+        hal_adj = r["total"] * (fx if fx else 1.0)
         base["HAL Total Cost"] = r["total"]
         base["TV Total Cost"] = tv_total
-        base["Var Total Cost"] = round(tv_total - r["total"], 2)
-        base["Var Total Cost %"] = (round((tv_total - r["total"]) / r["total"], 4)
-                                    if r["total"] else None)
+        base["Var Total Cost"] = round(tv_total - hal_adj, 2)
+        base["Var Total Cost %"] = (round((tv_total - hal_adj) / hal_adj, 4)
+                                    if hal_adj else None)
+        base["FX Rate Used"] = round(fx, 4) if fx else None
 
         if not matches:
             not_reconciled.append({**base, "Notes": "Not Bought In",
-                                   "Rounds Not Tying": ""})
+                                   "Rounds Not Tying": "", "FX Rate Used": None})
             continue
         bad = []
         for code in codes:
-            cost_ok = _cost_ok(tv[code]["total"], r["rounds"][code]["total"])
-            games_ok = tv[code]["games"] == r["rounds"][code]["games"]
+            hal_c = r["rounds"][code]["total"] * (fx if fx else 1.0)
+            cost_ok = _cost_ok(tv[code]["total"], hal_c)
+            # a zero-cost round (e.g. $0 parking) still expects its games, so
+            # count every matching date, not just the paid ones.
+            tv_games = tv[code]["present"] if not r["rounds"][code]["total"] else tv[code]["games"]
+            games_ok = tv_games == r["rounds"][code]["games"]
             if not (cost_ok and games_ok):
                 what = []
                 if not games_ok:
@@ -1596,8 +1616,9 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates):
                 labels.append("# Games")
             if any("Total Cost" in b for b in bad):
                 labels.append("Total Cost")
-            not_reconciled.append({**base, "Notes": ", ".join(labels),
-                                   "Rounds Not Tying": "; ".join(bad)})
+            not_reconciled.append({
+                **base, "Notes": ", ".join(labels), "Rounds Not Tying": "; ".join(bad),
+                "FX Rate Used": (_implied_fx(tv_total, r["total"]) if is_can else None)})
         else:
             reconciled.append({**base, "Rounds Not Tying": ""})
     reconciled.sort(key=lambda x: (x["Team"].lower(), x["Email"].lower()))
@@ -1624,8 +1645,8 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
         tv_src += [f"TV {code} Games", f"TV {code} Cost"]
     hal_cols += ["Total Cost"]; hal_src += ["HAL Total Cost"]
     tv_cols += ["Total Cost"]; tv_src += ["TV Total Cost"]
-    var_cols = ["Total Cost", "Total Cost %", "Rounds Not Tying"]
-    var_src = ["Var Total Cost", "Var Total Cost %", "Rounds Not Tying"]
+    var_cols = ["Total Cost", "Total Cost %", "FX Rate Used", "Rounds Not Tying"]
+    var_src = ["Var Total Cost", "Var Total Cost %", "FX Rate Used", "Rounds Not Tying"]
 
     def layout(lead):
         cols = lead + hal_cols + tv_cols + var_cols
@@ -1643,7 +1664,7 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
         cost |= {off + 2 * i + 2 for i in range(len(codes))}
         cost.add(off + len(tv_cols))
         cost.add(off + len(tv_cols) + 1)
-        pct = {off + len(tv_cols) + 2}
+        pct = {off + len(tv_cols) + 2, off + len(tv_cols) + 3}
         widths = [22 if c in ("Team", "Email") else 13 for c in cols]
         if lead[0] == "Variances":
             widths[0] = 22
@@ -1860,7 +1881,7 @@ def process():
             if is_playoffs:
                 rdates = _round_dates(vb["rows"], rounds)
                 reconciled, not_reconciled = reconcile_playoffs(
-                    recs, vb["primary"], rounds, rdates)
+                    recs, vb["primary"], rounds, rdates, fx_range)
                 data, m = build_playoff_workbook(
                     company, league, year, sel_type, as_of_fmt, rounds,
                     reconciled, not_reconciled, len(recs),
