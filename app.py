@@ -737,6 +737,11 @@ def parse_hal(rows, filename, company, year="", league="", sel_type="Both"):
     if ci["email"] is None:
         ci["email"] = _sniff_email_col(header, data_rows)
     if ci["email"] is None or ci["team"] is None:
+        if _looks_like_purchase_details(header):
+            raise ValueError(
+                f"{os.path.basename(filename)} looks like a TicketVault Purchase "
+                f"Details export, not a HAL. Upload it in the Purchase Details "
+                f"section instead of the HAL section.")
         raise ValueError(
             f"{os.path.basename(filename)}: couldn't find an email or team column. "
             f"Looked for email as {HAL_SYNONYMS['email']} (and by sniffing values) "
@@ -1425,6 +1430,15 @@ def _round_names(header, league):
     return found
 
 
+def _looks_like_purchase_details(header):
+    """True when a file dropped in the HAL zone is really a TicketVault
+    Purchase Details export (its distinctive column set)."""
+    hs = set(header)
+    marks = sum(1 for k in ("po email account", "team/performer", "po #",
+                            "opponent/performer", "ext po #", "po created") if k in hs)
+    return marks >= 3
+
+
 def parse_hal_playoffs(rows, filename, company, year="", league=""):
     """Parse a playoff HAL. Returns (records, excluded, annotations)."""
     hidx, header = _find_header_row(rows)
@@ -1440,6 +1454,11 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
     if ci["email"] is None:
         ci["email"] = _sniff_email_col(header, data_rows)
     if ci["email"] is None or ci["team"] is None:
+        if _looks_like_purchase_details(header):
+            raise ValueError(
+                f"{os.path.basename(filename)} looks like a TicketVault Purchase "
+                f"Details export, not a HAL. Upload it in the Purchase Details "
+                f"section instead of the HAL section.")
         raise ValueError(f"{os.path.basename(filename)}: couldn't find an email or "
                          f"team column in the playoff HAL.")
     if ci["status"] is None:
@@ -1455,6 +1474,7 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
     for idx, row in enumerate(data_rows):
         team_raw = _cell(row, ci["team"])
         team = _normalize_team(team_raw, league)
+        team_parking = "parking" in str(team_raw or "").lower()
         emails = _emails(_cell(row, ci["email"]))
         if not team or not emails:
             annotations.append((False, "No team or email"))
@@ -1500,9 +1520,10 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
         section = str(_num_cell(_cell(row, ci["section"]))).strip()
         row_v = str(_num_cell(_cell(row, ci["row"]))).strip()
         seats = _seat_text(_cell(row, ci["seats"]))
+        fp_v = str(_cell(row, ci["fp"]) or "").strip()
         out.append({
             "company": company, "emails": emails, "team": team,
-            "Full/Partial": str(_cell(row, ci["fp"]) or "").strip(),
+            "Full/Partial": fp_v,
             "Section": section, "Row": row_v, "Seats": seats,
             "Qty": _num_cell(_cell(row, ci["qty"])),
             "Email": str(_cell(row, ci["email"]) or "").strip(),
@@ -1510,7 +1531,7 @@ def parse_hal_playoffs(rows, filename, company, year="", league=""):
             "total": round(sum(v["total"] for v in per_round.values()), 2),
             "sec_n": _sec(_cell(row, ci["section"])),
             "row_n": _row(_cell(row, ci["row"])),
-            "is_parking": _is_parking_hal("", section, row_v),
+            "is_parking": team_parking or _is_parking_hal(fp_v, section, row_v),
             "_data_idx": idx,
         })
         annotations.append((True, ""))
@@ -1549,9 +1570,17 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=No
         for em in own:
             vr.extend(primary_index.get((em, r["team"]), []))
         hs = _seatnums(r["Seats"])
-        matches = [x for x in vr if _sec_match(x["sec"], r["sec_n"])
-                   and x["row"] == r["row_n"]
-                   and ((not hs) or (not x["seatset"]) or (x["seatset"] & hs))]
+        if r.get("is_parking"):
+            # same approach as the regular-season rec: try an exact lot/seat
+            # match first, then fall back to all of the team's parking rows.
+            seat_m = [x for x in vr if x["is_parking"]
+                      and _sec_match(x["sec"], r["sec_n"]) and x["row"] == r["row_n"]
+                      and ((not hs) or (not x["seatset"]) or (x["seatset"] & hs))]
+            matches = seat_m if seat_m else [x for x in vr if x["is_parking"]]
+        else:
+            matches = [x for x in vr if _sec_match(x["sec"], r["sec_n"])
+                       and x["row"] == r["row_n"]
+                       and ((not hs) or (not x["seatset"]) or (x["seatset"] & hs))]
         for x in matches:
             x["_hal"] = True
             if r.get("_hal_tab_row"):
@@ -1593,11 +1622,17 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=No
 
         base = {"Team": r["team"], "Email": r["Email"],
                 "Full/Partial": r.get("Full/Partial", ""), "Section": r["Section"],
-                "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"]}
+                "Row": r["Row"], "Seats": r["Seats"], "Qty": r["Qty"],
+                "_parking": r.get("is_parking", False)}
         for code in codes:
             base[f"HAL {code} Games"] = r["rounds"][code]["games"]
             base[f"HAL {code} Cost"] = round(r["rounds"][code]["total"], 2)
-            base[f"TV {code} Games"] = tv[code]["games"]
+            # a zero-cost round (e.g. $0 parking) still expects its games, so
+            # count every matching date, not just the paid ones — and show the
+            # same number that the comparison uses.
+            base[f"TV {code} Games"] = (tv[code]["present"]
+                                        if not r["rounds"][code]["total"]
+                                        else tv[code]["games"])
             base[f"TV {code} Cost"] = tv[code]["total"]
         hal_adj = r["total"] * (fx if fx else 1.0)
         base["HAL Total Cost"] = r["total"]
@@ -1615,9 +1650,7 @@ def reconcile_playoffs(hal_rows, primary_index, rounds, round_dates, fx_range=No
         for code in codes:
             hal_c = r["rounds"][code]["total"] * (fx if fx else 1.0)
             cost_ok = _cost_ok(tv[code]["total"], hal_c)
-            # a zero-cost round (e.g. $0 parking) still expects its games, so
-            # count every matching date, not just the paid ones.
-            tv_games = tv[code]["present"] if not r["rounds"][code]["total"] else tv[code]["games"]
+            tv_games = base[f"TV {code} Games"]
             games_ok = tv_games == r["rounds"][code]["games"]
             if not (cost_ok and games_ok):
                 what = []
@@ -1662,8 +1695,8 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
         tv_src += [f"TV {code} Games", f"TV {code} Cost"]
     hal_cols += ["Total Cost"]; hal_src += ["HAL Total Cost"]
     tv_cols += ["Total Cost"]; tv_src += ["TV Total Cost"]
-    var_cols = ["Total Cost", "Total Cost %", "FX Rate Used", "Rounds Not Tying"]
-    var_src = ["Var Total Cost", "Var Total Cost %", "FX Rate Used", "Rounds Not Tying"]
+    var_cols = ["Total Cost", "FX Rate Used", "Rounds Not Tying"]
+    var_src = ["Var Total Cost", "FX Rate Used", "Rounds Not Tying"]
 
     def layout(lead):
         cols = lead + hal_cols + tv_cols + var_cols
@@ -1681,7 +1714,7 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
         cost |= {off + 2 * i + 2 for i in range(len(codes))}
         cost.add(off + len(tv_cols))
         cost.add(off + len(tv_cols) + 1)
-        pct = {off + len(tv_cols) + 2, off + len(tv_cols) + 3}
+        pct = {off + len(tv_cols) + 2}
         widths = [22 if c in ("Team", "Email") else 13 for c in cols]
         if lead[0] == "Variances":
             widths[0] = 22
@@ -1727,20 +1760,30 @@ def build_playoff_workbook(company, league, year, sel_type, as_of, rounds,
         for c in (ws.cell(r, 1, a), ws.cell(r, 2, b)):
             c.font = Font(name=ARIAL, size=10, bold=bold); c.alignment = CENTER
 
+    t_rec = [x for x in reconciled if not x.get("_parking")]
+    p_rec = [x for x in reconciled if x.get("_parking")]
+    t_nr = [x for x in not_reconciled if not x.get("_parking")]
+    p_nr = [x for x in not_reconciled if x.get("_parking")]
     nbi = sum(1 for x in not_reconciled if x["Notes"] == "Not Bought In")
     bar(10, "RESULT"); hd(11, "Metric", "Count")
-    line(12, "Reconciled", len(reconciled))
-    line(13, "Not Reconciled", len(not_reconciled))
-    line(14, "Total # HAL Records", hal_total, bold=True)
-    bar(16, "NOT RECONCILED — BY REASON"); hd(17, "Reason", "Count")
-    line(18, "Not bought in", nbi)
-    line(19, "Round cost / games mismatch", len(not_reconciled) - nbi)
-    line(20, "TOTAL", len(not_reconciled), bold=True)
+    line(12, "Reconciled", len(t_rec))
+    line(13, "Not Reconciled", len(t_nr))
+    line(14, "Parking Reconciled", len(p_rec))
+    line(15, "Parking Not Reconciled", len(p_nr))
+    line(16, "Total # HAL Records", hal_total, bold=True)
+    bar(18, "NOT RECONCILED — BY REASON"); hd(19, "Reason", "Count")
+    line(20, "Not bought in", nbi)
+    line(21, "Round cost / games mismatch", len(not_reconciled) - nbi)
+    line(22, "TOTAL", len(not_reconciled), bold=True)
 
     _build_detail_tab(wb.create_sheet("Reconciled"), r_cols, r_src, r_w,
-                      reconciled, r_bands, r_cost, r_pct)
+                      t_rec, r_bands, r_cost, r_pct)
     _build_detail_tab(wb.create_sheet("Not Reconciled"), n_cols, n_src, n_w,
-                      not_reconciled, n_bands, n_cost, n_pct)
+                      t_nr, n_bands, n_cost, n_pct)
+    _build_detail_tab(wb.create_sheet("Parking Reconciled"), r_cols, r_src, r_w,
+                      p_rec, r_bands, r_cost, r_pct)
+    _build_detail_tab(wb.create_sheet("Parking Not Reconciled"), n_cols, n_src, n_w,
+                      p_nr, n_bands, n_cost, n_pct)
     _build_source_tab(wb.create_sheet("HAL"),
                       ["Included in Rec?", "Reason not Included"], [16, 32],
                       hal_blocks[0][0] if hal_blocks else [], hal_blocks, clean_seats=True)
